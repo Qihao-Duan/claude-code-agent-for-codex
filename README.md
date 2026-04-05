@@ -10,7 +10,7 @@ single MCP capability.
 
 ## Status
 
-- Current version: `v2.1.3`
+- Current version: `v2.2.0`
 - Local validation: 16 deterministic unit tests covering sync and async paths,
   structured failures, session resume, `claude_reply_start`,
   `claude_list_jobs`, streamed progress summaries, parse fallback,
@@ -18,6 +18,10 @@ single MCP capability.
 - Direct Claude CLI smoke on 2026-04-06: `claude -p --output-format stream-json`
   emitted init, tool-use, assistant text, and terminal result events exactly as
   expected.
+- Runtime-profile comparison on 2026-04-06: a "simple" launch
+  (`--disable-slash-commands --strict-mcp-config --mcp-config {"mcpServers":{}}`)
+  produced `slash_commands=[]` and `mcp_servers=[]` while preserving non-`bare`
+  auth behavior.
 - Live MCP smoke on 2026-04-06: integrated review still surfaced a structured
   `api_connection_refused` when Claude itself was unhealthy, but the job now
   retained stream-derived progress metadata instead of only heartbeat lines.
@@ -53,7 +57,7 @@ Optional defaults:
 codex mcp add claude-code-agent \
   --env CC_AGENT_MODEL=opus \
   --env CC_AGENT_DEFAULT_TIER=edit \
-  --env CC_AGENT_RUNTIME_PROFILE=integrated \
+  --env CC_AGENT_RUNTIME_PROFILE=simple \
   -- python3 ~/.codex/mcp-servers/claude-code-agent-for-codex/server.py
 ```
 
@@ -123,9 +127,14 @@ and recursive delete.
 
 ## Runtime Profiles
 
-The server supports two runtime profiles:
+The server supports three runtime profiles:
 
-- `integrated` (default)
+- `simple` (default)
+  Keeps local auth and normal Claude execution, but disables slash commands and
+  inherited MCP servers. This is the recommended Codex-to-Claude path because
+  it avoids bringing the local Claude plugin/skill/MCP ecosystem into every
+  delegated task.
+- `integrated`
   Inherits the local Claude Code environment, including local auth state,
   plugins, skills, and MCP configuration. This is the most compatible mode.
 - `isolated`
@@ -139,6 +148,14 @@ Important auth note:
   or an `apiKeyHelper` setting.
 - If you see `Not logged in · Please run /login` in isolated mode, that is
   expected unless explicit auth is configured for `--bare`.
+
+Important strategy note:
+
+- `simple` is the default because it keeps the useful part of "normal Claude"
+  while removing the two biggest sources of accidental complexity for this
+  bridge: inherited slash-command skills and inherited MCP servers.
+- Use `integrated` only when you explicitly want Claude to see the local Claude
+  ecosystem as part of the task.
 
 ## Parameters
 
@@ -157,7 +174,7 @@ Common parameters accepted by the execution tools:
 | `workingDirectory` | string | Working directory for the agent |
 | `addDirs` | string[] | Extra directories granted to Claude |
 | `maxBudgetUsd` | number | Claude Code budget cap |
-| `runtimeProfile` | enum | `integrated` or `isolated` |
+| `runtimeProfile` | enum | `simple`, `integrated`, or `isolated` |
 
 Sync-only:
 
@@ -194,7 +211,7 @@ launch", and "Claude itself returned an error".
 | `CC_AGENT_DEFAULT_TIER` | `edit` | Default tier when none is provided |
 | `CC_AGENT_TIMEOUT_SEC` | `900` | Hard timeout for the underlying Claude subprocess |
 | `CC_AGENT_SYNC_TIMEOUT_SEC` | `90` | Timeout used by sync MCP calls |
-| `CC_AGENT_RUNTIME_PROFILE` | `integrated` | Default runtime profile |
+| `CC_AGENT_RUNTIME_PROFILE` | `simple` | Default runtime profile |
 | `CC_AGENT_HEARTBEAT_SEC` | `5` | Async heartbeat interval |
 | `CC_AGENT_STATUS_PROGRESS_SEC` | `2` | Minimum interval between progress notifications while waiting in `claude_status` |
 | `CC_AGENT_STREAM_TEXT_PROGRESS_SEC` | `1` | Minimum delay before emitting another assistant text progress summary |
@@ -256,6 +273,20 @@ Clean diagnostic run:
 }
 ```
 
+Simple delegated review:
+
+```json
+{
+  "name": "claude_start",
+  "arguments": {
+    "prompt": "Review the parser refactor for correctness regressions.",
+    "tier": "readonly",
+    "runtimeProfile": "simple",
+    "workingDirectory": "/path/to/repo"
+  }
+}
+```
+
 ## Troubleshooting
 
 ### Sync call returns `sync_timeout`
@@ -269,6 +300,10 @@ If the client keeps using `claude` or `claude_reply`, progress notifications
 will improve visibility but will not remove the synchronous timeout boundary.
 For genuinely long work, use `claude_start` or `claude_reply_start`, then poll
 with `claude_status`.
+
+If long-running tasks also feel "too chatty" or "too coupled" to the local
+Claude environment, switch from `integrated` to `simple` before reaching for
+`isolated`.
 
 ### Async job stays in `running`
 
@@ -292,7 +327,14 @@ This is coming from Claude Code itself, not from the MCP transport layer. Run
 ### Isolated mode says `Not logged in`
 
 That usually means `--bare` does not have explicit auth configured. Provide
-`ANTHROPIC_API_KEY` or an `apiKeyHelper`, or switch back to `integrated`.
+`ANTHROPIC_API_KEY` or an `apiKeyHelper`, or switch back to `simple` or
+`integrated`.
+
+### Why is Claude seeing local skills or MCP servers?
+
+That means you are using `integrated`. Switch to `runtimeProfile: "simple"` to
+keep normal auth while disabling inherited slash commands and inherited MCP
+servers.
 
 ## Development
 
@@ -312,6 +354,7 @@ The current test suite covers:
 
 - sync timeout handling before MCP transport timeout
 - invalid tier and invalid sync-timeout validation
+- default simple-profile command shaping
 - `claude_reply` and `claude_reply_start` session continuation
 - async phase transitions, heartbeat updates, and persisted error payloads
 - progress notification emission for sync calls and async status waits

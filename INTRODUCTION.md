@@ -62,10 +62,13 @@ As of `v2.1.3`, that visibility is no longer just heartbeat text. The server
 now runs Claude in `stream-json` mode and translates Claude's own intermediate
 events into MCP progress updates and persisted async job state.
 
-### 2. Integrated vs Isolated Runtime
+### 2. Simple vs Integrated vs Isolated Runtime
 
-The server now exposes two runtime profiles:
+The server now exposes three runtime profiles:
 
+- `simple`
+  Keeps local auth, but disables inherited slash-command skills and inherited
+  MCP servers.
 - `integrated`
   Inherits the local Claude Code environment, including local auth state,
   plugins, skills, and MCP configuration.
@@ -74,8 +77,12 @@ The server now exposes two runtime profiles:
 
 This tradeoff matters in practice.
 
-`integrated` is usually the most compatible option because it can reuse the
-machine's existing Claude login state. It is therefore the default.
+`simple` is now the default because it keeps the useful part of the machine's
+existing Claude login state without dragging local Claude-specific ecosystem
+state into each delegated task.
+
+`integrated` is still the most compatible option when you explicitly want local
+plugins, skills, and MCP config to participate.
 
 `isolated` is better when you want a cleaner execution path, fewer inherited
 side effects, and more predictable behavior. But `--bare` does not read local
@@ -84,7 +91,8 @@ OAuth or keychain state, so it commonly requires explicit auth such as
 
 In other words:
 
-- `integrated` optimizes for "it works on my machine".
+- `simple` optimizes for "normal Claude, minimal baggage".
+- `integrated` optimizes for "full local Claude environment".
 - `isolated` optimizes for "I know exactly what environment Claude saw".
 
 ## Safety Model
@@ -143,15 +151,16 @@ The lifecycle is intentionally explicit:
 queued -> launching -> starting_claude -> running -> parsing_output -> completed|failed
 ```
 
-## What Changed in v2.1.3
+## What Changed in v2.2.0
 
-The current implementation adds seven practical improvements:
+The current implementation adds eight practical improvements:
 
 1. Structured sync failures.
    Sync calls now fail with a typed error payload before the outer MCP client
    timeout.
 2. Runtime profiles.
-   `integrated` and `isolated` make environment inheritance explicit.
+   `simple`, `integrated`, and `isolated` make environment inheritance
+   explicit.
 3. Async observability.
    Jobs now expose phase, heartbeat, command, and per-job logs.
 4. Better server resilience.
@@ -169,6 +178,10 @@ The current implementation adds seven practical improvements:
    The server now consumes Claude's `stream-json` output, surfaces tool-use and
    assistant-text summaries during execution, and persists the latest summary
    as `lastProgressMessage` for async jobs.
+8. A simple default runtime profile.
+   The default runtime now disables inherited slash commands and inherited MCP
+   servers while preserving normal auth behavior, which is a better fit for
+   Codex delegating into Claude than the old fully integrated default.
 
 ## Validation Snapshot
 
@@ -204,6 +217,8 @@ On the current machine:
 
 - direct `claude -p --output-format stream-json --verbose` smoke output showed
   init, tool-use, assistant-text, and terminal result events in order
+- direct "simple" runtime smoke output showed `slash_commands=[]` and
+  `mcp_servers=[]` without requiring `--bare`
 - the live MCP server successfully moved from the earlier `v2.0.0` baseline
   into the current `v2.1.x` line
 - async jobs exposed the new `phase`, `lastHeartbeatAt`, `logPath`, and

@@ -46,7 +46,7 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         self.server.DEBUG_LOG = self.debug_log
         self.server.DEFAULT_SYNC_TIMEOUT_SEC = 1
         self.server.DEFAULT_TIMEOUT_SEC = 5
-        self.server.DEFAULT_RUNTIME_PROFILE = "integrated"
+        self.server.DEFAULT_RUNTIME_PROFILE = "simple"
         self.server.HEARTBEAT_INTERVAL_SEC = 0.1
         self.server.STATUS_PROGRESS_INTERVAL_SEC = 0.1
 
@@ -58,7 +58,7 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
                 "CC_AGENT_DEBUG_LOG": str(self.debug_log),
                 "CC_AGENT_SYNC_TIMEOUT_SEC": "1",
                 "CC_AGENT_TIMEOUT_SEC": "5",
-                "CC_AGENT_RUNTIME_PROFILE": "integrated",
+                "CC_AGENT_RUNTIME_PROFILE": "simple",
                 "CC_AGENT_HEARTBEAT_SEC": "0.1",
                 "FAKE_CLAUDE_MODE": "success",
                 "FAKE_CLAUDE_SLEEP": "0",
@@ -216,6 +216,14 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
     def _tool_payload(self, response: dict) -> dict:
         return json.loads(response["result"]["content"][0]["text"])
 
+    def test_build_command_uses_simple_profile_by_default(self) -> None:
+        cmd = self.server.build_command("prompt", tier="readonly")
+        self.assertIn("--disable-slash-commands", cmd)
+        self.assertIn("--strict-mcp-config", cmd)
+        self.assertIn("--mcp-config", cmd)
+        self.assertIn('{"mcpServers": {}}', cmd)
+        self.assertNotIn("--bare", cmd)
+
     def test_build_command_adds_bare_for_isolated_profile(self) -> None:
         cmd = self.server.build_command(
             "prompt",
@@ -232,6 +240,15 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
             runtime_profile="integrated",
         )
         self.assertNotIn("--bare", integrated_cmd)
+        self.assertNotIn("--disable-slash-commands", integrated_cmd)
+
+        simple_cmd = self.server.build_command(
+            "prompt",
+            tier="readonly",
+            runtime_profile="simple",
+        )
+        self.assertNotIn("--bare", simple_cmd)
+        self.assertIn("--disable-slash-commands", simple_cmd)
 
     def test_build_command_preserves_zero_budget(self) -> None:
         cmd = self.server.build_command(
@@ -544,6 +561,7 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         status_payload = self._tool_payload(status_response)
         self.assertTrue(status_payload["done"])
         self.assertEqual(status_payload["threadId"], "session-async-123")
+        self.assertEqual(status_payload["runtimeProfile"], "simple")
 
         list_response = self.server.handle_request(
             {

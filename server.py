@@ -38,7 +38,7 @@ from typing import Any, Callable
 
 # ── Configuration via environment ────────────────────────────────────────
 SERVER_NAME = "claude-code-agent-for-codex"
-SERVER_VERSION = "2.1.3"
+SERVER_VERSION = "2.2.0"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 DEFAULT_MODEL = os.environ.get("CC_AGENT_MODEL", "")
@@ -48,7 +48,7 @@ DEFAULT_TIER = os.environ.get("CC_AGENT_DEFAULT_TIER", "edit")
 DEFAULT_TIMEOUT_SEC = int(os.environ.get("CC_AGENT_TIMEOUT_SEC", "900"))
 DEFAULT_SYNC_TIMEOUT_SEC = int(os.environ.get("CC_AGENT_SYNC_TIMEOUT_SEC", "90"))
 DEFAULT_MAX_BUDGET = os.environ.get("CC_AGENT_MAX_BUDGET_USD", "")
-DEFAULT_RUNTIME_PROFILE = os.environ.get("CC_AGENT_RUNTIME_PROFILE", "integrated")
+DEFAULT_RUNTIME_PROFILE = os.environ.get("CC_AGENT_RUNTIME_PROFILE", "simple")
 HEARTBEAT_INTERVAL_SEC = float(os.environ.get("CC_AGENT_HEARTBEAT_SEC", "5"))
 STATUS_PROGRESS_INTERVAL_SEC = float(
     os.environ.get("CC_AGENT_STATUS_PROGRESS_SEC", "2")
@@ -59,6 +59,7 @@ STREAM_TEXT_PROGRESS_INTERVAL_SEC = float(
 STREAM_TEXT_PROGRESS_MIN_CHARS = int(
     os.environ.get("CC_AGENT_STREAM_TEXT_PROGRESS_MIN_CHARS", "48")
 )
+EMPTY_MCP_CONFIG = json.dumps({"mcpServers": {}})
 
 # ── Permission Tiers ────────────────────────────────────────────────────
 #
@@ -272,7 +273,8 @@ def error_suggestion(
     if kind == "auth_required" and validate_runtime_profile(runtime_profile) == "isolated":
         return (
             "Isolated mode uses --bare and does not read local OAuth/keychain state. "
-            "Provide ANTHROPIC_API_KEY or apiKeyHelper, or switch back to integrated."
+            "Provide ANTHROPIC_API_KEY or apiKeyHelper, or switch back to simple "
+            "or integrated."
         )
     if kind == "auth_required":
         return "Authenticate Claude Code locally before retrying."
@@ -513,10 +515,10 @@ def summarize_stream_payload(
 
 def validate_runtime_profile(runtime_profile: str | None) -> str:
     profile = runtime_profile or DEFAULT_RUNTIME_PROFILE
-    if profile not in {"integrated", "isolated"}:
+    if profile not in {"simple", "integrated", "isolated"}:
         raise ValueError(
             f"Unknown runtimeProfile '{profile}'. "
-            "Valid: integrated, isolated"
+            "Valid: simple, integrated, isolated"
         )
     return profile
 
@@ -800,6 +802,15 @@ def build_command(
     ]
     if selected_runtime_profile == "isolated":
         cmd.append("--bare")
+    elif selected_runtime_profile == "simple":
+        cmd.extend(
+            [
+                "--disable-slash-commands",
+                "--strict-mcp-config",
+                "--mcp-config",
+                EMPTY_MCP_CONFIG,
+            ]
+        )
 
     # Session resume
     if session_id:
@@ -1558,11 +1569,12 @@ COMMON_PARAMS: dict[str, dict[str, Any]] = {
     },
     "runtimeProfile": {
         "type": "string",
-        "enum": ["integrated", "isolated"],
+        "enum": ["simple", "integrated", "isolated"],
         "description": (
-            "Runtime profile. integrated (default) inherits the local Claude "
-            "environment. isolated runs with --bare for a cleaner, more "
-            "predictable agent environment."
+            "Runtime profile. simple (default) keeps local auth but disables "
+            "slash commands and inherited MCP servers. integrated inherits "
+            "the full local Claude environment. isolated runs with --bare "
+            "for a cleaner, more predictable agent environment."
         ),
     },
 }
