@@ -6,27 +6,20 @@
 
 ## The Problem
 
-You already have **codex-mcp-server** — it lets Claude Code delegate tasks to
-Codex. But the bridge is one-way. When Codex needs Claude Code's deep codebase
-reasoning, multi-step editing, or its rich tool ecosystem, there's no
-standardized way to call it back.
+You have **codex-mcp-server** (CC -> Codex). But the bridge is one-way. When
+Codex needs Claude Code's deep codebase reasoning, there's no way to call back.
 
-`claude mcp serve` exists, but it exposes CC's *individual tools* (Read, Edit,
-Bash...). That's like handing someone a screwdriver when they asked for a
-carpenter. What Codex actually needs is the *agent* — the full autonomous loop
-that plans, explores, edits, tests, and iterates.
+`claude mcp serve` exists but exposes CC's *individual tools* (Read, Edit,
+Bash). That's a screwdriver when you asked for a carpenter. Codex needs the
+*agent* — the full loop that plans, explores, edits, tests, and iterates.
 
 ## The Solution
-
-This MCP server wraps `claude -p` (the non-interactive agent mode) and exposes
-it through 8 well-defined tools. Codex sends a task; CC's agent loop handles
-the rest.
 
 ```
                            MCP (stdio)
   Codex  ─────────────────────────────>  this server
                                               │
-                                         claude -p "..."
+                                         claude -p (stdin)
                                               │
                                      ┌────────┴────────┐
                                      │  CC Agent Loop   │
@@ -36,6 +29,58 @@ the rest.
                                      │  WebSearch  ...  │
                                      └─────────────────-┘
 ```
+
+## Permission Tiers
+
+The core design: **how much power should Codex give CC?**
+
+Inspired by CC's auto-mode classifier (8 allow rules, 25 block rules), the
+server provides 5 tiers. Each tier layers defense-in-depth: an outer ring of
+tool restrictions from this server, plus CC's inner auto-mode classifier.
+
+```
+  Safety ████████████████████░░░░░░░░░░░░░░░░░░░░ Capability
+         readonly   explore   edit    full   unrestricted
+```
+
+| Tier | Permission Mode | Tools Available | Deny Patterns | Use Case |
+|------|----------------|-----------------|---------------|----------|
+| **`readonly`** | `plan` | Read, Grep, Glob | 0 | Code review, analysis, questions |
+| **`explore`** | `auto` | Read, Grep, Glob, Bash | 6 | Investigation, debugging, log analysis |
+| **`edit`** | `auto` | All (default) | 12 | **DEFAULT.** Most coding tasks |
+| **`full`** | `auto` | All | 0 | Complex tasks needing max flexibility |
+| **`unrestricted`** | `bypassPermissions` | All | 0 | Sandbox environments ONLY |
+
+### What does each tier block?
+
+**`edit` tier** (default) denies these patterns via `--settings` JSON:
+```
+Bash(rm -rf *)        Bash(rm -r *)           # irreversible deletion
+Bash(sudo *)                                  # privilege escalation
+Bash(git push --force *)  Bash(git push -f *) # destructive git
+Bash(git reset --hard *)  Bash(git clean -f *) Bash(git branch -D *)
+Bash(chmod 777 *)                             # security weakening
+Bash(mkfs *)  Bash(dd *)  Bash(kill -9 *)     # system-level damage
+```
+
+CC's auto-mode classifier (25 block rules) **still runs underneath**, catching
+production deploys, data exfiltration, credential leaks, and more. The deny
+list is defense-in-depth — two independent safety layers.
+
+### How Codex chooses a tier
+
+```json
+// "Just analyze this, don't touch anything"
+{ "name": "claude", "arguments": { "prompt": "...", "tier": "readonly" } }
+
+// "Fix this bug" (default tier=edit, safe for most work)
+{ "name": "claude", "arguments": { "prompt": "..." } }
+
+// "This is complex, I trust CC's own safety classifier"
+{ "name": "claude", "arguments": { "prompt": "...", "tier": "full" } }
+```
+
+Codex can also call the `tiers` tool to discover available tiers at runtime.
 
 ## Tools at a Glance
 
@@ -47,15 +92,15 @@ the rest.
                                   claude_status
                                   claude_list_jobs
 
- Utility
- ───────
- ping
- help
+ Discovery / Utility
+ ───────────────────
+ tiers            list available permission tiers
+ ping             health check
+ help             claude --help output
 ```
 
-**When to use sync vs async?** If the task finishes in under ~2 minutes, use
-`claude` / `claude_reply`. For deeper work (refactors, multi-file edits, test
-suites), use `claude_start` + `claude_status` to avoid MCP timeout.
+**Sync vs async?** Tasks under ~2 min: `claude`. Longer work: `claude_start` +
+`claude_status` (avoids MCP's ~120s timeout). Jobs persist to disk.
 
 ## Quick Start
 
@@ -64,164 +109,144 @@ suites), use `claude_start` + `claude_status` to avoid MCP timeout.
 codex mcp add claude-code-agent -- \
     python3 ~/.codex/mcp-servers/claude-code-agent-for-codex/server.py
 
-# With a preferred model
+# With a preferred model and default tier
 codex mcp add claude-code-agent \
     --env CC_AGENT_MODEL=opus \
+    --env CC_AGENT_DEFAULT_TIER=edit \
     -- python3 ~/.codex/mcp-servers/claude-code-agent-for-codex/server.py
 
 # Verify
 codex mcp list
 ```
 
-That's it. Next time you start Codex, it can call `claude(prompt="...")`.
+## Examples
 
-## What Codex Can Do With It
-
-**Delegate complex coding tasks**
+**Safe code analysis** (readonly tier)
 ```json
 {
   "name": "claude",
   "arguments": {
-    "prompt": "Refactor the auth middleware in src/auth/ to use JWT instead of session cookies. Update all tests.",
+    "prompt": "Review src/parser.ts for edge cases. What am I missing?",
+    "tier": "readonly"
+  }
+}
+```
+
+**Fix a bug** (default edit tier)
+```json
+{
+  "name": "claude",
+  "arguments": {
+    "prompt": "The CSV parser crashes on empty lines. Fix it and add a test.",
     "workingDirectory": "/home/user/myproject",
     "effort": "high"
   }
 }
 ```
 
-**Get a second opinion on code**
-```json
-{
-  "name": "claude",
-  "arguments": {
-    "prompt": "Review the changes in src/parser.ts. Are there edge cases I'm missing?",
-    "permissionMode": "plan",
-    "effort": "medium"
-  }
-}
-```
-
-**Long-running task (async)**
+**Long refactor** (async, full tier)
 ```json
 {
   "name": "claude_start",
   "arguments": {
-    "prompt": "Migrate the entire test suite from Jest to Vitest. Run tests after migration to verify.",
-    "workingDirectory": "/home/user/myproject",
-    "effort": "max"
+    "prompt": "Migrate test suite from Jest to Vitest. Run tests to verify.",
+    "tier": "full",
+    "workingDirectory": "/home/user/myproject"
   }
 }
-// Returns: { "jobId": "abc123...", "status": "queued", "done": false }
+// Returns: { "jobId": "abc...", "status": "queued", "done": false }
 
-// Later:
-{
-  "name": "claude_status",
-  "arguments": { "jobId": "abc123...", "waitSeconds": 30 }
-}
-// Returns: { "done": true, "response": "...", "threadId": "..." }
+// Poll:
+{ "name": "claude_status", "arguments": { "jobId": "abc...", "waitSeconds": 30 } }
 ```
 
-**Multi-turn conversation**
+**Multi-turn** (session resume)
 ```json
-// First call
-{ "name": "claude", "arguments": { "prompt": "Analyze the database schema in schema.sql" } }
-// Returns: { "threadId": "sess-xyz", "response": "The schema has 12 tables..." }
+{ "name": "claude", "arguments": { "prompt": "Analyze the DB schema in schema.sql" } }
+// Returns: { "threadId": "sess-xyz", "response": "12 tables..." }
 
-// Follow-up (same session)
-{ "name": "claude_reply", "arguments": { "threadId": "sess-xyz", "prompt": "Now add an index for the users.email column" } }
+{ "name": "claude_reply", "arguments": { "threadId": "sess-xyz", "prompt": "Add an index on users.email" } }
 ```
 
 ## Parameters
 
-Every tool accepts these optional parameters:
-
 | Parameter | Values | Default |
 |-----------|--------|---------|
+| **`tier`** | `readonly`, `explore`, `edit`, `full`, `unrestricted` | `edit` |
 | `model` | `opus`, `sonnet`, `haiku`, or full model ID | CC default |
 | `effort` | `low`, `medium`, `high`, `max` | CC default |
-| `permissionMode` | `default`, `plan`, `auto`, `bypassPermissions` | `auto` |
-| `allowedTools` | `"Bash Edit Read Grep Glob Write"` | all tools |
+| `permissionMode` | overrides tier's mode | set by tier |
+| `allowedTools` | overrides tier's tool whitelist | set by tier |
+| `disallowedTools` | overrides tier's deny list | set by tier |
 | `workingDirectory` | absolute path | server's cwd |
 | `addDirs` | `["/path/a", "/path/b"]` | none |
 | `maxBudgetUsd` | number | no limit |
 | `systemPrompt` | string | none |
 
-## Environment Variables
+Override priority: **explicit param > tier defaults > env defaults**.
 
-Configure defaults without changing code:
+## Environment Variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CLAUDE_BIN` | `claude` | CLI binary path |
-| `CC_AGENT_MODEL` | — | Default model |
-| `CC_AGENT_EFFORT` | — | Default effort |
-| `CC_AGENT_PERMISSION_MODE` | `auto` | Default permissions |
+| `CC_AGENT_MODEL` | -- | Default model |
+| `CC_AGENT_EFFORT` | -- | Default effort |
+| `CC_AGENT_DEFAULT_TIER` | `edit` | Default permission tier |
 | `CC_AGENT_TIMEOUT_SEC` | `900` | Max seconds per invocation |
-| `CC_AGENT_MAX_BUDGET_USD` | — | Default budget cap |
-| `CC_AGENT_SYSTEM_PROMPT` | — | Default system prompt |
+| `CC_AGENT_MAX_BUDGET_USD` | -- | Default budget cap |
+| `CC_AGENT_SYSTEM_PROMPT` | -- | Default system prompt |
 
 ## Design Decisions
 
-### Why `auto` permission mode?
+### Why tiers instead of raw permission flags?
 
-When CC runs as a delegated agent, no human is watching. `plan` mode
-(read-only) is too restrictive for real coding tasks. `auto` mode lets CC
-approve safe operations (file reads, searches) while still blocking
-destructive ones (force push, rm -rf). It's the sweet spot between safety and
-autonomy.
+Raw flags (`permissionMode`, `allowedTools`) require Codex to understand CC's
+permission model. Tiers reduce this to a single dial: *"how much do I trust CC
+for this task?"* The answer maps to a tested, safe configuration.
 
-### Why the async pattern?
+### Why two safety layers?
 
-CC agent tasks can take 2--15 minutes for complex work. MCP's tool-call
-timeout is ~120 seconds. The async pattern (`claude_start` returns a jobId
-immediately; `claude_status` polls) decouples execution from the timeout.
-Jobs persist to disk, so they survive MCP server restarts.
+Layer 1 (this server): `--settings` JSON with deny patterns removes dangerous
+tools from CC's context entirely — the model can't even attempt them.
 
-### Why Python, not Node.js?
+Layer 2 (CC auto-mode): 25 block rules catch intent-level threats (production
+deploys, data exfiltration, credential scanning) that pattern matching can't.
 
-Zero dependencies. The server is a single file using only Python stdlib. No
-`npm install`, no `node_modules`, no build step. It follows the same pattern
-as the existing `claude-review` MCP server that already works in production
-with Codex.
+Neither layer alone is sufficient. Pattern deny lists miss creative workarounds.
+Auto-mode classifiers have false negatives. Together: defense-in-depth.
 
-### Why not just `claude mcp serve`?
+### Why `edit` as the default tier?
 
-That exposes CC's *low-level tools* (Read, Edit, Bash). Codex already has
-equivalent capabilities. The value of CC-as-agent is the *judgment loop* —
-the ability to plan multi-step approaches, try alternatives when something
-fails, and iterate until the task is done. That's what `claude -p` provides
-and what this server wraps.
+- `readonly` / `explore`: too restrictive for the common case (Codex delegates
+  coding tasks, which require Edit/Write)
+- `full`: safe in practice (CC's auto-mode catches real dangers), but the deny
+  list provides a visible, auditable safety boundary
+- `edit`: all tools enabled, 12 known-dangerous patterns removed, auto-mode
+  classifier active underneath. The right balance for unsupervised delegation.
 
-## Test Results
+### Why stdin for prompt delivery?
 
-All tests pass (tested 2026-04-05):
+CC's CLI uses variadic flags (`--tools <tools...>`, `--disallowedTools <tools...>`)
+that greedily consume trailing arguments — including the prompt. Passing the
+prompt via stdin avoids this entirely and works reliably with all flag
+combinations.
+
+## Test Results (v2.0.0, 2026-04-05)
 
 ```
+=== Tier Tests (all sync) ===
+  readonly  (5+3=8)  ................ PASS  4.0s
+  explore   (9-4=5)  ................ PASS  3.4s
+  edit      (6*7=42) ................ PASS  4.0s
+  full      (3*3=9)  ................ PASS  3.5s
+
+=== Async Test ===
+  claude_start + claude_status ...... PASS  (10+10=20)
+
 === Protocol Tests ===
-  Initialize .......................... PASS
-  Tools List (8 tools) ................ PASS
-  Ping ................................ PASS
-  Help ................................ PASS
-  List Jobs (empty) ................... PASS
-  Unknown Tool Error .................. PASS
-  Validation (missing prompt) ......... PASS
-  Validation (missing threadId) ....... PASS
-  Validation (bad jobId) .............. PASS
-
-=== End-to-End Tests ===
-  Sync Agent (2+2=4) .................. PASS  (3.9s)
-  Async Start + Poll (3*7=21) ......... PASS  (5.5s)
-  Session Resume (21*2=42) ............ PASS
-  Job Listing ......................... PASS
-```
-
-## File Structure
-
-```
-~/.codex/mcp-servers/claude-code-agent-for-codex/
-    server.py          # The MCP server (single file, zero deps)
-    README.md          # Technical reference
-    INTRODUCTION.md    # This document
+  Initialize, tools/list, ping,
+  help, tiers, validation, errors ... 9/9 PASS
 ```
 
 ## Symmetry
@@ -231,11 +256,12 @@ All tests pass (tested 2026-04-05):
 | CC -> Codex | `codex-mcp-server` | `codex exec` | stdio (Node.js) |
 | Codex -> CC | `claude-code-agent-for-codex` | `claude -p` | stdio (Python) |
 
-Together, they complete the bidirectional bridge between the two agent systems.
+Together: bidirectional bridge. Either agent can delegate to the other.
 
 ## References
 
-- [MCP Specification](https://modelcontextprotocol.io/specification/2025-03-26) — The protocol this server implements
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) — The agent being wrapped
-- [codex-mcp-server](https://github.com/tuannvm/codex-mcp-server) — The symmetric counterpart (CC -> Codex)
-- [Multi-Agent Task Delegation](https://arxiv.org/abs/2402.01680) — Architectural pattern reference
+- [MCP Specification (2025-03-26)](https://modelcontextprotocol.io/specification/2025-03-26) -- Protocol standard
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) -- The wrapped agent
+- [codex-mcp-server](https://github.com/tuannvm/codex-mcp-server) -- Symmetric counterpart
+- [CC Auto-Mode Classifier](https://docs.anthropic.com/en/docs/claude-code/security) -- 8 allow + 25 block rules
+- [Multi-Agent Task Delegation](https://arxiv.org/abs/2402.01680) -- Architecture pattern
