@@ -58,6 +58,10 @@ progress token. That improves visibility, but it does not change the first
 principle: a synchronous tool call is still bounded. Progress is visibility,
 not infinite task duration.
 
+As of `v2.1.3`, that visibility is no longer just heartbeat text. The server
+now runs Claude in `stream-json` mode and translates Claude's own intermediate
+events into MCP progress updates and persisted async job state.
+
 ### 2. Integrated vs Isolated Runtime
 
 The server now exposes two runtime profiles:
@@ -121,6 +125,7 @@ Each job now records:
 - `status`
 - `phase`
 - `lastHeartbeatAt`
+- `lastProgressMessage`
 - `childPid`
 - `logPath`
 - `stdoutPath`
@@ -138,9 +143,9 @@ The lifecycle is intentionally explicit:
 queued -> launching -> starting_claude -> running -> parsing_output -> completed|failed
 ```
 
-## What Changed in v2.1.2
+## What Changed in v2.1.3
 
-The current implementation adds six practical improvements:
+The current implementation adds seven practical improvements:
 
 1. Structured sync failures.
    Sync calls now fail with a typed error payload before the outer MCP client
@@ -157,9 +162,13 @@ The current implementation adds six practical improvements:
    and early-stdin-close cases now resolve to explicit and test-covered
    behavior.
 6. Progress visibility.
-   Sync calls and bounded async waits now emit `notifications/progress` when
-   the client provides a progress token, and async status responses now expose
-   the newest lifecycle log line directly.
+   Sync calls and bounded async waits emit `notifications/progress` when the
+   client provides a progress token, and async status responses expose the
+   newest lifecycle log line directly.
+7. Streamed Claude event summaries.
+   The server now consumes Claude's `stream-json` output, surfaces tool-use and
+   assistant-text summaries during execution, and persists the latest summary
+   as `lastProgressMessage` for async jobs.
 
 ## Validation Snapshot
 
@@ -175,6 +184,7 @@ The repo includes deterministic unit tests for:
 - `claude_list_jobs` enumeration
 - async heartbeat and phase transitions
 - progress notification emission for sync calls and async status waits
+- streamed tool-use and assistant-text summaries
 - persisted async failure payloads
 - raw stdout fallback when Claude returns non-JSON success output
 - structured nonzero handling when Claude writes only to stderr
@@ -188,18 +198,19 @@ Run them with:
 python3 -m unittest -v tests.test_server
 ```
 
-### Live behavior observed on 2026-04-05
+### Live behavior observed on 2026-04-06
 
 On the current machine:
 
+- direct `claude -p --output-format stream-json --verbose` smoke output showed
+  init, tool-use, assistant-text, and terminal result events in order
 - the live MCP server successfully moved from the earlier `v2.0.0` baseline
   into the current `v2.1.x` line
 - async jobs exposed the new `phase`, `lastHeartbeatAt`, `logPath`, and
   `startedCommand` fields as expected
-- a sync review call hit the configured 60-second limit and returned a
-  structured `sync_timeout` instead of vanishing behind the client transport
 - integrated mode could still fail with Claude-side `ECONNREFUSED`, which the
-  server now preserves as a structured async error
+  server now preserves as a structured async error while also retaining
+  stream-derived progress summaries
 - isolated mode returned quickly but surfaced the expected bare-mode auth issue
   (`Not logged in · Please run /login`) until explicit auth is provided
 

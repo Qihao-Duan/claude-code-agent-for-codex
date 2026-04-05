@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import shutil
 import signal
 import shlex
@@ -37,7 +38,7 @@ from typing import Any, Callable
 
 # ── Configuration via environment ────────────────────────────────────────
 SERVER_NAME = "claude-code-agent-for-codex"
-SERVER_VERSION = "2.1.2"
+SERVER_VERSION = "2.1.3"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 DEFAULT_MODEL = os.environ.get("CC_AGENT_MODEL", "")
@@ -51,6 +52,12 @@ DEFAULT_RUNTIME_PROFILE = os.environ.get("CC_AGENT_RUNTIME_PROFILE", "integrated
 HEARTBEAT_INTERVAL_SEC = float(os.environ.get("CC_AGENT_HEARTBEAT_SEC", "5"))
 STATUS_PROGRESS_INTERVAL_SEC = float(
     os.environ.get("CC_AGENT_STATUS_PROGRESS_SEC", "2")
+)
+STREAM_TEXT_PROGRESS_INTERVAL_SEC = float(
+    os.environ.get("CC_AGENT_STREAM_TEXT_PROGRESS_SEC", "1")
+)
+STREAM_TEXT_PROGRESS_MIN_CHARS = int(
+    os.environ.get("CC_AGENT_STREAM_TEXT_PROGRESS_MIN_CHARS", "48")
 )
 
 # ── Permission Tiers ────────────────────────────────────────────────────
@@ -184,6 +191,9 @@ def configure_binary_stdio() -> None:
     MCP_STDIN = os.fdopen(sys.stdin.fileno(), "rb", buffering=0)
 
 
+SEND_LOCK = threading.Lock()
+
+
 def clip_text(text: str, limit: int = 500) -> str | None:
     stripped = text.strip()
     if not stripped:
@@ -277,12 +287,13 @@ def send_response(response: dict[str, Any]) -> None:
         "utf-8"
     )
     debug_log(f"SEND {payload.decode('utf-8', errors='replace')[:2000]}")
-    if _use_ndjson:
-        MCP_STDOUT.write(payload + b"\n")
-    else:
-        header = f"Content-Length: {len(payload)}\r\n\r\n".encode("utf-8")
-        MCP_STDOUT.write(header + payload)
-    MCP_STDOUT.flush()
+    with SEND_LOCK:
+        if _use_ndjson:
+            MCP_STDOUT.write(payload + b"\n")
+        else:
+            header = f"Content-Length: {len(payload)}\r\n\r\n".encode("utf-8")
+            MCP_STDOUT.write(header + payload)
+        MCP_STDOUT.flush()
 
 
 def send_notification(method: str, params: dict[str, Any]) -> None:
@@ -374,20 +385,130 @@ def find_claude_bin() -> str | None:
     return shutil.which(CLAUDE_BIN)
 
 
-def parse_claude_json(raw_stdout: str) -> tuple[dict[str, Any] | None, str | None]:
-    """Extract the JSON object from ``claude -p --output-format json`` output."""
+def parse_json_line(raw_line: str) -> dict[str, Any] | None:
+    candidate = raw_line.strip()
+    if not candidate:
+        return None
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def parse_claude_output(raw_stdout: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Extract the terminal payload from Claude stdout.
+
+    Supports both the legacy single-JSON-object mode and the newer
+    ``--output-format stream-json`` event stream.
+    """
     lines = [ln.strip() for ln in raw_stdout.splitlines() if ln.strip()]
     if not lines:
         return None, "Claude CLI returned empty output"
-    # Walk backwards — the JSON payload is typically the last line.
+    final_result: dict[str, Any] | None = None
     for candidate in reversed(lines):
-        try:
-            payload = json.loads(candidate)
-        except json.JSONDecodeError:
+        payload = parse_json_line(candidate)
+        if payload is None:
             continue
-        if isinstance(payload, dict):
-            return payload, None
+        if payload.get("type") == "result":
+            final_result = payload
+            break
+        if any(key in payload for key in ("result", "error", "is_error")):
+            final_result = payload
+            break
+    if final_result is not None:
+        return final_result, None
     return None, "Claude CLI did not return valid JSON"
+
+
+def extract_message_text(message: dict[str, Any] | None) -> str | None:
+    if not isinstance(message, dict):
+        return None
+    text_parts: list[str] = []
+    for block in message.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "text":
+            continue
+        text_value = block.get("text")
+        if isinstance(text_value, str):
+            text_parts.append(text_value)
+    joined = "".join(text_parts)
+    return clip_text(" ".join(joined.split()), limit=160)
+
+
+def flush_text_progress(stream_state: dict[str, Any]) -> str | None:
+    buffered = str(stream_state.get("text_buffer") or "")
+    snippet = clip_text(" ".join(buffered.split()), limit=160)
+    stream_state["text_buffer"] = ""
+    if snippet:
+        stream_state["last_text_emit_at"] = time.monotonic()
+        return f"Assistant: {snippet}"
+    return None
+
+
+def summarize_stream_payload(
+    payload: dict[str, Any],
+    stream_state: dict[str, Any],
+) -> str | None:
+    payload_type = payload.get("type")
+    if payload_type == "system":
+        if payload.get("subtype") == "init":
+            model = payload.get("model") or "unknown-model"
+            permission_mode = payload.get("permissionMode") or "unknown"
+            return (
+                "Claude session initialized "
+                f"(model={model}, permission={permission_mode})"
+            )
+        return None
+    if payload_type == "assistant":
+        assistant_text = extract_message_text(payload.get("message"))
+        if assistant_text:
+            stream_state["text_buffer"] = ""
+            return f"Assistant: {assistant_text}"
+        return None
+    if payload_type != "stream_event":
+        return None
+
+    event = payload.get("event")
+    if not isinstance(event, dict):
+        return None
+    event_type = event.get("type")
+    if event_type == "content_block_start":
+        content_block = event.get("content_block")
+        if not isinstance(content_block, dict):
+            return None
+        if content_block.get("type") == "tool_use":
+            tool_name = content_block.get("name") or "tool"
+            return f"Claude started tool {tool_name}"
+        return None
+    if event_type == "content_block_delta":
+        delta = event.get("delta")
+        if not isinstance(delta, dict):
+            return None
+        if delta.get("type") != "text_delta":
+            return None
+        text_delta = str(delta.get("text") or "")
+        if not text_delta:
+            return None
+        stream_state["text_buffer"] = f"{stream_state.get('text_buffer', '')}{text_delta}"
+        normalized = " ".join(str(stream_state.get("text_buffer") or "").split())
+        if not normalized:
+            return None
+        now = time.monotonic()
+        if (
+            "\n" not in text_delta
+            and len(normalized) < STREAM_TEXT_PROGRESS_MIN_CHARS
+            and now - float(stream_state.get("last_text_emit_at") or 0.0)
+            < STREAM_TEXT_PROGRESS_INTERVAL_SEC
+        ):
+            return None
+        stream_state["text_buffer"] = ""
+        stream_state["last_text_emit_at"] = now
+        return f"Assistant: {clip_text(normalized, limit=160)}"
+    if event_type in {"content_block_stop", "message_stop"}:
+        return flush_text_progress(stream_state)
+    return None
 
 
 def validate_runtime_profile(runtime_profile: str | None) -> str:
@@ -456,6 +577,8 @@ def execute_claude_command(
     keep_logs: bool = False,
     on_start: Any = None,
     on_heartbeat: Any = None,
+    on_stdout_line: Callable[[str], None] | None = None,
+    on_stderr_line: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     if (stdout_path is None) != (stderr_path is None):
         raise ValueError("stdout_path and stderr_path must be provided together")
@@ -471,6 +594,47 @@ def execute_claude_command(
     timed_out = False
     returncode: int | None = None
     proc: subprocess.Popen[str] | None = None
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    stream_events: queue.SimpleQueue[tuple[str, str]] = queue.SimpleQueue()
+    stdout_thread: threading.Thread | None = None
+    stderr_thread: threading.Thread | None = None
+
+    def reader_thread(
+        pipe: Any,
+        output_handle: Any,
+        sink: list[str],
+        stream_name: str,
+    ) -> None:
+        if pipe is None:
+            return
+        try:
+            while True:
+                line = pipe.readline()
+                if line == "":
+                    break
+                sink.append(line)
+                output_handle.write(line)
+                output_handle.flush()
+                stream_events.put((stream_name, line))
+        finally:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+    def drain_stream_events() -> None:
+        while True:
+            try:
+                stream_name, line = stream_events.get_nowait()
+            except queue.Empty:
+                break
+            stripped = line.rstrip("\r\n")
+            if stream_name == "stdout" and on_stdout_line:
+                on_stdout_line(stripped)
+            elif stream_name == "stderr" and on_stderr_line:
+                on_stderr_line(stripped)
+
     try:
         with (
             stdout_file_path.open("w", encoding="utf-8") as stdout_file,
@@ -479,15 +643,29 @@ def execute_claude_command(
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
-                stdout=stdout_file,
-                stderr=stderr_file,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
+                bufsize=1,
                 cwd=working_directory or None,
                 env=env,
                 start_new_session=True,
             )
             if on_start:
                 on_start(proc.pid, started_command)
+
+            stdout_thread = threading.Thread(
+                target=reader_thread,
+                args=(proc.stdout, stdout_file, stdout_chunks, "stdout"),
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=reader_thread,
+                args=(proc.stderr, stderr_file, stderr_chunks, "stderr"),
+                daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
 
             if proc.stdin is not None:
                 try:
@@ -503,6 +681,7 @@ def execute_claude_command(
             started_monotonic = time.monotonic()
             last_heartbeat = started_monotonic
             while True:
+                drain_stream_events()
                 returncode = proc.poll()
                 now = time.monotonic()
                 if returncode is not None:
@@ -525,13 +704,14 @@ def execute_claude_command(
                         f"after timeout handling"
                     )
                     returncode = proc.poll()
+            if stdout_thread is not None:
+                stdout_thread.join(timeout=1)
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=1)
+            drain_stream_events()
     finally:
-        stdout_text = ""
-        stderr_text = ""
-        if stdout_file_path.exists():
-            stdout_text = stdout_file_path.read_text(encoding="utf-8")
-        if stderr_file_path.exists():
-            stderr_text = stderr_file_path.read_text(encoding="utf-8")
+        stdout_text = "".join(stdout_chunks)
+        stderr_text = "".join(stderr_chunks)
         if not keep_logs and owned_paths:
             remove_path_if_exists(stdout_file_path)
             remove_path_if_exists(stderr_file_path)
@@ -610,7 +790,14 @@ def build_command(
     )
     selected_runtime_profile = validate_runtime_profile(runtime_profile)
 
-    cmd: list[str] = [bin_path, "-p", "--output-format", "json"]
+    cmd: list[str] = [
+        bin_path,
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+    ]
     if selected_runtime_profile == "isolated":
         cmd.append("--bare")
 
@@ -701,6 +888,7 @@ def run_claude_agent(
     on_start: Any = None,
     on_heartbeat: Any = None,
     progress_callback: Callable[[str], None] | None = None,
+    on_stream_summary: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Run ``claude -p`` synchronously and return structured result."""
     try:
@@ -731,24 +919,40 @@ def run_claude_agent(
 
     timeout_value = timeout_sec if timeout_sec is not None else DEFAULT_TIMEOUT_SEC
     started_monotonic = time.monotonic()
+    stream_state: dict[str, Any] = {
+        "text_buffer": "",
+        "last_text_emit_at": 0.0,
+    }
+
+    def emit_progress(message: str) -> None:
+        if progress_callback:
+            progress_callback(message)
+
+    def emit_stream_summary(message: str | None) -> None:
+        if not message:
+            return
+        if on_stream_summary:
+            on_stream_summary(message)
+        emit_progress(message)
 
     def handle_start(child_pid: int, child_command: str) -> None:
         if on_start:
             on_start(child_pid, child_command)
-        if progress_callback:
-            progress_callback(f"Claude started (pid={child_pid})")
+        emit_progress(f"Claude started (pid={child_pid})")
 
     def handle_heartbeat(child_pid: int) -> None:
         if on_heartbeat:
             on_heartbeat(child_pid)
-        if progress_callback:
-            elapsed = max(int(time.monotonic() - started_monotonic), 0)
-            progress_callback(
-                f"Claude still running after {elapsed}s (pid={child_pid})"
-            )
+        elapsed = max(int(time.monotonic() - started_monotonic), 0)
+        emit_progress(f"Claude still running after {elapsed}s (pid={child_pid})")
 
-    if progress_callback:
-        progress_callback("Launching Claude CLI")
+    def handle_stdout_line(raw_line: str) -> None:
+        payload = parse_json_line(raw_line)
+        if payload is None:
+            return
+        emit_stream_summary(summarize_stream_payload(payload, stream_state))
+
+    emit_progress("Launching Claude CLI")
 
     try:
         result = execute_claude_command(
@@ -762,6 +966,7 @@ def run_claude_agent(
             keep_logs=keep_logs,
             on_start=handle_start,
             on_heartbeat=handle_heartbeat,
+            on_stdout_line=handle_stdout_line,
         )
     except ValueError as exc:
         return None, build_error(
@@ -777,10 +982,9 @@ def run_claude_agent(
         )
 
     if result["timed_out"]:
-        if progress_callback:
-            progress_callback(
-                f"Claude timed out after {timeout_value}s; switching to error response"
-            )
+        emit_progress(
+            f"Claude timed out after {timeout_value}s; switching to error response"
+        )
         return None, build_error(
             "sync_timeout",
             f"Claude agent timed out after {timeout_value}s",
@@ -789,10 +993,11 @@ def run_claude_agent(
             suggestion=error_suggestion("sync_timeout"),
         )
 
-    payload, parse_error = parse_claude_json(result["stdout"])
+    emit_stream_summary(flush_text_progress(stream_state))
+
+    payload, parse_error = parse_claude_output(result["stdout"])
     if parse_error:
-        if progress_callback:
-            progress_callback("Claude process exited; parsing output")
+        emit_progress("Claude process exited; parsing output")
         stderr = result["stderr"].strip()
         raw_stdout = result["stdout"].strip()
         raw_text = raw_stdout or stderr
@@ -842,8 +1047,7 @@ def run_claude_agent(
     assert payload is not None
 
     if result["returncode"] != 0 or payload.get("is_error"):
-        if progress_callback:
-            progress_callback("Claude returned an error payload")
+        emit_progress("Claude returned an error payload")
         message = str(
             payload.get("result")
             or payload.get("error")
@@ -866,8 +1070,7 @@ def run_claude_agent(
     model_name = payload.get("model", "") or model or DEFAULT_MODEL
     cost = payload.get("cost_usd") or payload.get("total_cost_usd")
 
-    if progress_callback:
-        progress_callback("Claude completed successfully")
+    emit_progress("Claude completed successfully")
 
     resolved_tier = tier or DEFAULT_TIER
     return {
@@ -978,6 +1181,7 @@ def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
         "startedAt": job.get("startedAt"),
         "completedAt": job.get("completedAt"),
         "lastHeartbeatAt": job.get("lastHeartbeatAt"),
+        "lastProgressMessage": job.get("lastProgressMessage"),
         "childPid": job.get("childPid"),
         "logPath": job.get("logPath"),
         "stdoutPath": str(job_stdout_path(job.get("jobId"))),
@@ -992,8 +1196,11 @@ def format_job_progress_message(job: dict[str, Any]) -> str:
     job_id = str(job.get("jobId") or "unknown")
     phase = job.get("phase") or job.get("status") or "unknown"
     parts = [f"Job {job_id} is {phase}"]
+    latest_progress_message = job.get("lastProgressMessage")
     latest_log_line = read_last_nonempty_line(job_log_path(job_id))
-    if latest_log_line:
+    if latest_progress_message:
+        parts.append(str(latest_progress_message))
+    elif latest_log_line:
         parts.append(latest_log_line)
     return " · ".join(parts)
 
@@ -1030,6 +1237,7 @@ def start_async_agent(
         "completedAt": None,
         "updatedAt": created_at,
         "lastHeartbeatAt": None,
+        "lastProgressMessage": None,
         "error": None,
         "result": None,
         "workerPid": None,
@@ -1124,6 +1332,7 @@ def get_job_status(
                 job.get("status"),
                 job.get("phase"),
                 job.get("lastHeartbeatAt"),
+                job.get("lastProgressMessage"),
                 job.get("completedAt"),
                 read_last_nonempty_line(job_log_path(job_id)),
             )
@@ -1184,28 +1393,36 @@ def run_async_job(job_id: str) -> int:
         disallowed = req.get("disallowedTools")
         if disallowed and not isinstance(disallowed, list):
             disallowed = None
+        job_update_lock = threading.Lock()
 
         def mark_start(child_pid: int, started_command: str) -> None:
-            update_job_file(
-                job_id,
-                phase="running",
-                childPid=child_pid,
-                lastHeartbeatAt=utc_now(),
-                startedCommand=started_command,
-            )
-            append_job_log(
-                job_id,
-                f"CLAUDE_STARTED child_pid={child_pid} command={started_command}",
-            )
+            with job_update_lock:
+                update_job_file(
+                    job_id,
+                    phase="running",
+                    childPid=child_pid,
+                    lastHeartbeatAt=utc_now(),
+                    startedCommand=started_command,
+                )
+                append_job_log(
+                    job_id,
+                    f"CLAUDE_STARTED child_pid={child_pid} command={started_command}",
+                )
 
         def mark_heartbeat(child_pid: int) -> None:
-            update_job_file(
-                job_id,
-                phase="running",
-                childPid=child_pid,
-                lastHeartbeatAt=utc_now(),
-            )
-            append_job_log(job_id, f"HEARTBEAT child_pid={child_pid}")
+            with job_update_lock:
+                update_job_file(
+                    job_id,
+                    phase="running",
+                    childPid=child_pid,
+                    lastHeartbeatAt=utc_now(),
+                )
+                append_job_log(job_id, f"HEARTBEAT child_pid={child_pid}")
+
+        def record_stream_summary(message: str) -> None:
+            with job_update_lock:
+                update_job_file(job_id, lastProgressMessage=message)
+                append_job_log(job_id, f"PROGRESS {message}")
 
         update_job_file(job_id, phase="starting_claude")
         append_job_log(job_id, "PHASE starting_claude")
@@ -1230,6 +1447,7 @@ def run_async_job(job_id: str) -> int:
             keep_logs=True,
             on_start=mark_start,
             on_heartbeat=mark_heartbeat,
+            on_stream_summary=record_stream_summary,
         )
         if read_json(job_path).get("childPid"):
             update_job_file(job_id, phase="parsing_output")

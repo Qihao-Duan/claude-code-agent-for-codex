@@ -10,14 +10,17 @@ single MCP capability.
 
 ## Status
 
-- Current version: `v2.1.2`
+- Current version: `v2.1.3`
 - Local validation: 16 deterministic unit tests covering sync and async paths,
   structured failures, session resume, `claude_reply_start`,
-  `claude_list_jobs`, progress notifications, parse fallback, zero-budget
-  handling, and invalid configuration guards.
-- Live smoke on 2026-04-05: a sync review request returned a structured
-  `sync_timeout`, and a later async review surfaced a structured
-  `api_connection_refused` error with heartbeat and log metadata intact.
+  `claude_list_jobs`, streamed progress summaries, parse fallback,
+  zero-budget handling, and invalid configuration guards.
+- Direct Claude CLI smoke on 2026-04-06: `claude -p --output-format stream-json`
+  emitted init, tool-use, assistant text, and terminal result events exactly as
+  expected.
+- Live MCP smoke on 2026-04-06: integrated review still surfaced a structured
+  `api_connection_refused` when Claude itself was unhealthy, but the job now
+  retained stream-derived progress metadata instead of only heartbeat lines.
 
 ## Use Cases
 
@@ -32,7 +35,10 @@ single MCP capability.
 ### Prerequisites
 
 1. Install Claude Code and confirm `claude -p` works on the machine.
-2. Make sure Codex can run local stdio MCP servers.
+2. Use a recent Claude Code version whose `claude --help` shows
+   `--output-format stream-json`, `--verbose`, and
+   `--include-partial-messages`.
+3. Make sure Codex can run local stdio MCP servers.
 
 ### Install in Codex
 
@@ -68,12 +74,14 @@ The server supports two execution styles:
 - Sync: `claude`, `claude_reply`
   Best for short tasks. These calls use a shorter sync timeout by default so
   they return a structured `sync_timeout` error before the MCP client itself
-  times out. When the client provides `_meta.progressToken` (Codex does), the
-  server emits `notifications/progress` during the run.
+  times out. Under the hood the server runs Claude in `stream-json` mode; when
+  the client provides `_meta.progressToken` (Codex does), the server converts
+  streamed Claude events into `notifications/progress`.
 - Async: `claude_start`, `claude_reply_start`, `claude_status`
   Best for long-running work. Async jobs persist state on disk, emit heartbeat
-  timestamps, expose per-job logs, and `claude_status` can emit
-  `notifications/progress` during bounded waits.
+  timestamps, expose per-job logs, record the latest stream-derived progress
+  summary, and `claude_status` can emit `notifications/progress` during
+  bounded waits.
 
 Important boundary:
 
@@ -165,6 +173,7 @@ final Claude response:
 - `phase`: `queued`, `launching`, `starting_claude`, `running`,
   `parsing_output`, `completed`, `failed`
 - `lastHeartbeatAt`: last heartbeat timestamp while Claude is still running
+- `lastProgressMessage`: latest summarized Claude stream event
 - `childPid`: active Claude subprocess PID when known
 - `logPath`: lifecycle log for the job
 - `stdoutPath` / `stderrPath`: persisted Claude stdout/stderr log files
@@ -188,6 +197,8 @@ launch", and "Claude itself returned an error".
 | `CC_AGENT_RUNTIME_PROFILE` | `integrated` | Default runtime profile |
 | `CC_AGENT_HEARTBEAT_SEC` | `5` | Async heartbeat interval |
 | `CC_AGENT_STATUS_PROGRESS_SEC` | `2` | Minimum interval between progress notifications while waiting in `claude_status` |
+| `CC_AGENT_STREAM_TEXT_PROGRESS_SEC` | `1` | Minimum delay before emitting another assistant text progress summary |
+| `CC_AGENT_STREAM_TEXT_PROGRESS_MIN_CHARS` | `48` | Minimum buffered assistant text before early progress emission |
 | `CC_AGENT_MAX_BUDGET_USD` | unset | Default budget cap |
 | `CC_AGENT_DEBUG_LOG` | `/tmp/claude-code-agent-for-codex-debug.log` | Server debug log |
 | `CC_AGENT_STATE_DIR` | `~/.codex/state/claude-code-agent-for-codex/` | Async job state directory |
@@ -264,12 +275,14 @@ with `claude_status`.
 Inspect:
 
 - `lastHeartbeatAt`
+- `lastProgressMessage`
 - `logPath`
 - `latestLogLine`
 - the sibling `*.stdout.log` and `*.stderr.log` files in the job state directory
 
 If `lastHeartbeatAt` is still moving, the server is healthy and Claude is still
-working.
+working. If `lastProgressMessage` is changing, Claude is actively producing
+stream events even before the final result lands.
 
 ### `API Error: Unable to connect to API (ECONNREFUSED)`
 
@@ -302,8 +315,9 @@ The current test suite covers:
 - `claude_reply` and `claude_reply_start` session continuation
 - async phase transitions, heartbeat updates, and persisted error payloads
 - progress notification emission for sync calls and async status waits
+- stream-event summaries for tool use and assistant text
 - `claude_list_jobs` output
-- `latestLogLine` / stdout-stderr path exposure in async status
+- `latestLogLine` / `lastProgressMessage` / stdout-stderr path exposure in async status
 - raw stdout fallback for non-JSON success output
 - structured handling for stderr-only nonzero exits
 - isolated-mode auth guidance

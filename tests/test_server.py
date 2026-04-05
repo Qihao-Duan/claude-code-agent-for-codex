@@ -89,15 +89,22 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
 
                 prompt = sys.stdin.read()
                 resume_id = None
+                output_format = "text"
+                permission_mode = "default"
                 for index, arg in enumerate(args):
                     if arg == "--resume" and index + 1 < len(args):
                         resume_id = args[index + 1]
-                        break
+                    if arg == "--output-format" and index + 1 < len(args):
+                        output_format = args[index + 1]
+                    if arg == "--permission-mode" and index + 1 < len(args):
+                        permission_mode = args[index + 1]
+
+                stream_mode = output_format == "stream-json"
+
+                def emit(payload):
+                    print(json.dumps(payload), flush=True)
 
                 sleep_sec = float(os.environ.get("FAKE_CLAUDE_SLEEP", "0"))
-                if sleep_sec:
-                    time.sleep(sleep_sec)
-
                 mode = os.environ.get("FAKE_CLAUDE_MODE", "success")
                 if mode == "bad_json":
                     print("not-json")
@@ -105,30 +112,101 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
                 if mode == "stderr_error":
                     print("stderr failure", file=sys.stderr)
                     raise SystemExit(int(os.environ.get("FAKE_CLAUDE_EXIT", "3")))
+                if stream_mode:
+                    emit({
+                        "type": "system",
+                        "subtype": "init",
+                        "model": "fake-model",
+                        "permissionMode": permission_mode,
+                    })
+
+                if sleep_sec:
+                    time.sleep(sleep_sec)
+
                 if mode == "api_refused":
-                    print(json.dumps({
+                    payload = {
                         "is_error": True,
                         "error": "API Error: Unable to connect to API (ECONNREFUSED)",
-                    }))
+                    }
+                    if stream_mode:
+                        payload = {
+                            "type": "result",
+                            "is_error": True,
+                            "result": "API Error: Unable to connect to API (ECONNREFUSED)",
+                            "session_id": os.environ.get("FAKE_CLAUDE_SESSION", "fake-session"),
+                        }
+                        emit(payload)
+                    else:
+                        print(json.dumps(payload))
                     raise SystemExit(1)
                 if mode == "auth_required":
-                    print(json.dumps({
+                    payload = {
                         "is_error": True,
                         "error": "Not logged in · Please run /login",
                         "session_id": "auth-session",
-                    }))
+                    }
+                    if stream_mode:
+                        payload = {
+                            "type": "result",
+                            "is_error": True,
+                            "result": "Not logged in · Please run /login",
+                            "session_id": "auth-session",
+                        }
+                        emit(payload)
+                    else:
+                        print(json.dumps(payload))
                     raise SystemExit(1)
 
                 result_text = os.environ.get("FAKE_CLAUDE_RESULT") or prompt.strip() or "ok"
-                print(json.dumps({
-                    "is_error": False,
-                    "result": result_text,
-                    "session_id": resume_id or os.environ.get("FAKE_CLAUDE_SESSION", "fake-session"),
-                    "duration_ms": 12,
-                    "stop_reason": "end_turn",
-                    "total_cost_usd": 0.01,
-                    "num_turns": 1,
-                }))
+                if stream_mode:
+                    emit({
+                        "type": "stream_event",
+                        "event": {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {"type": "tool_use", "name": "Read"},
+                        },
+                    })
+                    emit({
+                        "type": "stream_event",
+                        "event": {
+                            "type": "content_block_start",
+                            "index": 1,
+                            "content_block": {"type": "text", "text": ""},
+                        },
+                    })
+                    emit({
+                        "type": "stream_event",
+                        "event": {
+                            "type": "content_block_delta",
+                            "index": 1,
+                            "delta": {"type": "text_delta", "text": result_text},
+                        },
+                    })
+                    emit({
+                        "type": "stream_event",
+                        "event": {"type": "message_stop"},
+                    })
+                    emit({
+                        "type": "result",
+                        "is_error": False,
+                        "result": result_text,
+                        "session_id": resume_id or os.environ.get("FAKE_CLAUDE_SESSION", "fake-session"),
+                        "duration_ms": 12,
+                        "stop_reason": "end_turn",
+                        "total_cost_usd": 0.01,
+                        "num_turns": 1,
+                    })
+                else:
+                    print(json.dumps({
+                        "is_error": False,
+                        "result": result_text,
+                        "session_id": resume_id or os.environ.get("FAKE_CLAUDE_SESSION", "fake-session"),
+                        "duration_ms": 12,
+                        "stop_reason": "end_turn",
+                        "total_cost_usd": 0.01,
+                        "num_turns": 1,
+                    }))
                 """
             ),
             encoding="utf-8",
@@ -144,6 +222,8 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
             tier="readonly",
             runtime_profile="isolated",
         )
+        self.assertIn("stream-json", cmd)
+        self.assertIn("--verbose", cmd)
         self.assertIn("--bare", cmd)
 
         integrated_cmd = self.server.build_command(
@@ -234,6 +314,11 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         )
         messages = [params["message"] for _, params in notifications]
         self.assertIn("Launching Claude CLI", messages[0])
+        self.assertTrue(
+            any("Claude session initialized" in message for message in messages)
+        )
+        self.assertTrue(any("Claude started tool Read" in message for message in messages))
+        self.assertTrue(any("Assistant: hello" in message for message in messages))
         self.assertTrue(any("Claude still running" in message for message in messages))
         self.assertIn("Claude completed successfully", messages[-1])
 
@@ -349,6 +434,7 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         self.assertEqual(running["runtimeProfile"], "isolated")
         self.assertTrue(Path(running["logPath"]).exists())
         self.assertIn("--bare", running["startedCommand"])
+        self.assertIn("stream-json", running["startedCommand"])
 
         completed, status_error = self.server.get_job_status(job_id, wait_seconds=5)
         self.assertIsNone(status_error)
@@ -356,9 +442,11 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         self.assertEqual(completed["phase"], "completed")
         self.assertEqual(completed["response"], "async-ok")
         self.assertEqual(completed["runtimeProfile"], "isolated")
+        self.assertIsNotNone(completed["lastProgressMessage"])
 
         job_log = Path(completed["logPath"]).read_text(encoding="utf-8")
         self.assertIn("HEARTBEAT", job_log)
+        self.assertIn("PROGRESS Claude session initialized", job_log)
         self.assertIn("JOB_COMPLETED", job_log)
 
     def test_async_job_failure_persists_structured_error(self) -> None:
@@ -408,6 +496,7 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         status_payload = self._tool_payload(status_response)
         self.assertIn(status_payload["status"], {"running", "completed"})
         self.assertIsNotNone(status_payload["latestLogLine"])
+        self.assertIsNotNone(status_payload["lastProgressMessage"])
         self.assertTrue(status_payload["stdoutPath"].endswith(".stdout.log"))
         self.assertTrue(status_payload["stderrPath"].endswith(".stderr.log"))
         self.assertGreaterEqual(len(notifications), 1)
@@ -416,6 +505,9 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         )
         self.assertTrue(
             any("Job " in params["message"] for _, params in notifications)
+        )
+        self.assertTrue(
+            any("Claude session initialized" in params["message"] for _, params in notifications)
         )
 
     def test_claude_reply_start_and_list_jobs(self) -> None:
