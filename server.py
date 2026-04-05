@@ -38,15 +38,103 @@ sys.stdin = os.fdopen(sys.stdin.fileno(), "rb", buffering=0)
 
 # ── Configuration via environment ────────────────────────────────────────
 SERVER_NAME = "claude-code-agent-for-codex"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "2.0.0"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 DEFAULT_MODEL = os.environ.get("CC_AGENT_MODEL", "")
 DEFAULT_EFFORT = os.environ.get("CC_AGENT_EFFORT", "")
 DEFAULT_SYSTEM_PROMPT = os.environ.get("CC_AGENT_SYSTEM_PROMPT", "")
-DEFAULT_PERMISSION_MODE = os.environ.get("CC_AGENT_PERMISSION_MODE", "auto")
+DEFAULT_TIER = os.environ.get("CC_AGENT_DEFAULT_TIER", "edit")
 DEFAULT_TIMEOUT_SEC = int(os.environ.get("CC_AGENT_TIMEOUT_SEC", "900"))
 DEFAULT_MAX_BUDGET = os.environ.get("CC_AGENT_MAX_BUDGET_USD", "")
+
+# ── Permission Tiers ────────────────────────────────────────────────────
+#
+# Modeled on CC's auto-mode classifier (8 allow rules, 25 block rules).
+# Each tier combines --permission-mode, --tools (whitelist), and
+# --disallowedTools (blacklist) for defense-in-depth.
+#
+#   readonly < explore < edit < full < unrestricted
+#
+# In -p (non-interactive) mode, anything the auto classifier blocks
+# silently fails — the agent adapts.  The tiers add an OUTER ring of
+# protection so the agent never even *sees* the dangerous tools.
+
+PERMISSION_TIERS: dict[str, dict[str, Any]] = {
+    "readonly": {
+        "description": (
+            "Read-only analysis. No file edits, no shell commands. "
+            "Use for: code review, architecture analysis, questions."
+        ),
+        "permission_mode": "plan",
+        "tools": "Read,Grep,Glob",
+        "disallowed_tools": [],
+    },
+    "explore": {
+        "description": (
+            "Read + safe shell commands. No file modifications. "
+            "Use for: investigation, debugging, log analysis, git status."
+        ),
+        "permission_mode": "auto",
+        "tools": "Read,Grep,Glob,Bash",
+        "disallowed_tools": [
+            # No destructive shell commands
+            "Bash(rm -rf *)",
+            "Bash(rm -r *)",
+            "Bash(rmdir *)",
+            "Bash(sudo *)",
+            "Bash(kill -9 *)",
+            "Bash(chmod 777 *)",
+        ],
+    },
+    "edit": {
+        "description": (
+            "Full coding with safety guardrails. DEFAULT tier. "
+            "All tools enabled, destructive patterns denied. "
+            "CC auto-mode classifier + deny list = two-layer defense."
+        ),
+        "permission_mode": "auto",
+        "tools": None,  # all tools (CC default)
+        "disallowed_tools": [
+            # ── Irreversible file destruction ─────────────────────
+            "Bash(rm -rf *)",
+            "Bash(rm -r *)",
+            # ── Privilege escalation ──────────────────────────────
+            "Bash(sudo *)",
+            # ── Destructive git (Codex should own git workflow) ───
+            "Bash(git push --force *)",
+            "Bash(git push -f *)",
+            "Bash(git reset --hard *)",
+            "Bash(git clean -f *)",
+            "Bash(git branch -D *)",
+            # ── Security weakening ────────────────────────────────
+            "Bash(chmod 777 *)",
+            # ── Disk-level / system-level ─────────────────────────
+            "Bash(mkfs *)",
+            "Bash(dd *)",
+            "Bash(kill -9 *)",
+        ],
+    },
+    "full": {
+        "description": (
+            "CC auto-mode classifier is the ONLY safety layer. "
+            "No additional tool restrictions from this server. "
+            "Use for: complex tasks that need maximum flexibility."
+        ),
+        "permission_mode": "auto",
+        "tools": None,
+        "disallowed_tools": [],
+    },
+    "unrestricted": {
+        "description": (
+            "Bypass ALL permission checks. SANDBOX ENVIRONMENTS ONLY. "
+            "Equivalent to --dangerously-skip-permissions."
+        ),
+        "permission_mode": "bypassPermissions",
+        "tools": None,
+        "disallowed_tools": [],
+    },
+}
 
 DEBUG_LOG = Path(
     os.environ.get("CC_AGENT_DEBUG_LOG", f"/tmp/{SERVER_NAME}-debug.log")
@@ -159,6 +247,38 @@ def parse_claude_json(raw_stdout: str) -> tuple[dict[str, Any] | None, str | Non
     return None, "Claude CLI did not return valid JSON"
 
 
+def resolve_tier(
+    tier: str | None,
+    *,
+    permission_mode_override: str | None = None,
+    allowed_tools_override: str | None = None,
+    disallowed_tools_override: list[str] | None = None,
+) -> dict[str, Any]:
+    """Resolve a tier name + optional overrides into CLI flags.
+
+    Priority: explicit parameter overrides > tier defaults > global defaults.
+    """
+    tier_name = tier or DEFAULT_TIER
+    if tier_name not in PERMISSION_TIERS:
+        raise ValueError(
+            f"Unknown tier '{tier_name}'. "
+            f"Valid: {', '.join(PERMISSION_TIERS)}"
+        )
+    tier_cfg = PERMISSION_TIERS[tier_name]
+
+    return {
+        "permission_mode": permission_mode_override or tier_cfg["permission_mode"],
+        "tools": tier_cfg.get("tools"),  # whitelist (None = all)
+        "disallowed_tools": (
+            disallowed_tools_override
+            if disallowed_tools_override is not None
+            else tier_cfg.get("disallowed_tools", [])
+        ),
+        "allowed_tools": allowed_tools_override,
+        "tier_name": tier_name,
+    }
+
+
 def build_command(
     prompt: str,
     *,
@@ -166,8 +286,10 @@ def build_command(
     model: str | None = None,
     effort: str | None = None,
     system_prompt: str | None = None,
+    tier: str | None = None,
     permission_mode: str | None = None,
     allowed_tools: str | None = None,
+    disallowed_tools: list[str] | None = None,
     working_directory: str | None = None,
     add_dirs: list[str] | None = None,
     max_budget_usd: float | None = None,
@@ -175,6 +297,14 @@ def build_command(
     bin_path = find_claude_bin()
     if not bin_path:
         raise FileNotFoundError(f"Claude CLI not found: {CLAUDE_BIN}")
+
+    # ── Resolve tier into concrete CLI flags ─────────────────────────
+    resolved = resolve_tier(
+        tier,
+        permission_mode_override=permission_mode,
+        allowed_tools_override=allowed_tools,
+        disallowed_tools_override=disallowed_tools,
+    )
 
     cmd: list[str] = [bin_path, "-p", "--output-format", "json"]
 
@@ -197,14 +327,26 @@ def build_command(
     if selected_system:
         cmd.extend(["--system-prompt", selected_system])
 
-    # Permission mode
-    selected_perm = permission_mode or DEFAULT_PERMISSION_MODE
-    if selected_perm:
-        cmd.extend(["--permission-mode", selected_perm])
+    # Permission mode (from tier resolution)
+    if resolved["permission_mode"]:
+        cmd.extend(["--permission-mode", resolved["permission_mode"]])
 
-    # Allowed tools
-    if allowed_tools is not None:
-        cmd.extend(["--allowedTools", allowed_tools])
+    # Tools whitelist (from tier — restricts which built-in tools exist)
+    if resolved["tools"]:
+        cmd.extend(["--tools", resolved["tools"]])
+
+    # Allowed tools (explicit override — auto-approve these without prompt)
+    if resolved["allowed_tools"]:
+        cmd.extend(["--allowedTools", resolved["allowed_tools"]])
+
+    # Disallowed tools (from tier — removes dangerous patterns entirely)
+    # Passed via --settings JSON because --disallowedTools is variadic and
+    # would consume the trailing prompt argument.  Complex patterns like
+    # "Bash(rm -rf *)" also contain spaces that break CLI space-splitting.
+    deny_patterns = resolved.get("disallowed_tools") or []
+    if deny_patterns:
+        settings_obj = {"permissions": {"deny": deny_patterns}}
+        cmd.extend(["--settings", json.dumps(settings_obj)])
 
     # Working directory
     if working_directory:
@@ -220,8 +362,9 @@ def build_command(
     if budget:
         cmd.extend(["--max-budget-usd", str(budget)])
 
-    # Prompt is the last positional argument
-    cmd.append(prompt)
+    # NOTE: prompt is NOT appended here — it is passed via stdin in
+    # run_claude_agent() to avoid being consumed by variadic CLI flags
+    # like --tools <tools...> or --disallowedTools <tools...>.
     return cmd
 
 
@@ -232,8 +375,10 @@ def run_claude_agent(
     model: str | None = None,
     effort: str | None = None,
     system_prompt: str | None = None,
+    tier: str | None = None,
     permission_mode: str | None = None,
     allowed_tools: str | None = None,
+    disallowed_tools: list[str] | None = None,
     working_directory: str | None = None,
     add_dirs: list[str] | None = None,
     max_budget_usd: float | None = None,
@@ -246,8 +391,10 @@ def run_claude_agent(
             model=model,
             effort=effort,
             system_prompt=system_prompt,
+            tier=tier,
             permission_mode=permission_mode,
             allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
             working_directory=working_directory,
             add_dirs=add_dirs,
             max_budget_usd=max_budget_usd,
@@ -264,9 +411,9 @@ def run_claude_agent(
     try:
         result = subprocess.run(
             cmd,
+            input=prompt,  # pass prompt via stdin (avoids variadic flag issues)
             capture_output=True,
             text=True,
-            stdin=subprocess.DEVNULL,
             timeout=DEFAULT_TIMEOUT_SEC,
             cwd=working_directory or None,
             env=env,
@@ -285,6 +432,7 @@ def run_claude_agent(
                 "threadId": None,
                 "response": raw_text,
                 "model": model or DEFAULT_MODEL,
+                "tier": tier or DEFAULT_TIER,
                 "duration_ms": None,
                 "stop_reason": "parse_fallback",
             }, None
@@ -307,10 +455,12 @@ def run_claude_agent(
     model_name = payload.get("model", "") or model or DEFAULT_MODEL
     cost = payload.get("cost_usd") or payload.get("total_cost_usd")
 
+    resolved_tier = tier or DEFAULT_TIER
     return {
         "threadId": thread_id,
         "response": response_text,
         "model": model_name,
+        "tier": resolved_tier,
         "duration_ms": payload.get("duration_ms"),
         "stop_reason": payload.get("stop_reason"),
         "cost_usd": cost,
@@ -375,8 +525,10 @@ def start_async_agent(
     model: str | None = None,
     effort: str | None = None,
     system_prompt: str | None = None,
+    tier: str | None = None,
     permission_mode: str | None = None,
     allowed_tools: str | None = None,
+    disallowed_tools: list[str] | None = None,
     working_directory: str | None = None,
     add_dirs: list[str] | None = None,
     max_budget_usd: float | None = None,
@@ -399,8 +551,10 @@ def start_async_agent(
             "model": model,
             "effort": effort,
             "systemPrompt": system_prompt,
+            "tier": tier,
             "permissionMode": permission_mode,
             "allowedTools": allowed_tools,
+            "disallowedTools": disallowed_tools,
             "workingDirectory": working_directory,
             "addDirs": add_dirs,
             "maxBudgetUsd": max_budget_usd,
@@ -500,14 +654,20 @@ def run_async_job(job_id: str) -> int:
         budget_raw = req.get("maxBudgetUsd")
         budget = float(budget_raw) if budget_raw else None
 
+        disallowed = req.get("disallowedTools")
+        if disallowed and not isinstance(disallowed, list):
+            disallowed = None
+
         payload, error = run_claude_agent(
             str(req.get("prompt", "")),
             session_id=req.get("threadId"),
             model=req.get("model"),
             effort=req.get("effort"),
             system_prompt=req.get("systemPrompt"),
+            tier=req.get("tier"),
             permission_mode=req.get("permissionMode"),
             allowed_tools=req.get("allowedTools"),
+            disallowed_tools=disallowed,
             working_directory=req.get("workingDirectory"),
             add_dirs=add_dirs,
             max_budget_usd=budget,
@@ -541,6 +701,19 @@ def run_async_job(job_id: str) -> int:
 # ── MCP tool definitions ─────────────────────────────────────────────────
 
 COMMON_PARAMS: dict[str, dict[str, Any]] = {
+    "tier": {
+        "type": "string",
+        "enum": ["readonly", "explore", "edit", "full", "unrestricted"],
+        "description": (
+            "Permission tier controlling what CC can do. "
+            "readonly: read-only analysis (no edits, no shell). "
+            "explore: read + safe shell (no file modifications). "
+            "edit: full coding with safety guardrails (DEFAULT). "
+            "full: CC auto-mode classifier only, no extra restrictions. "
+            "unrestricted: bypass all checks (SANDBOX ONLY). "
+            "Explicit permissionMode/allowedTools override tier settings."
+        ),
+    },
     "model": {
         "type": "string",
         "description": (
@@ -562,18 +735,25 @@ COMMON_PARAMS: dict[str, dict[str, Any]] = {
         "type": "string",
         "enum": ["default", "plan", "auto", "bypassPermissions"],
         "description": (
-            "Permission mode. 'plan' = read-only planning, "
-            "'auto' = auto-approve safe actions, "
-            "'bypassPermissions' = full access (dangerous). "
-            "Defaults to 'auto'."
+            "Override the tier's permission mode. "
+            "'plan' = read-only, 'auto' = classifier-based, "
+            "'bypassPermissions' = no checks (dangerous)."
         ),
     },
     "allowedTools": {
         "type": "string",
         "description": (
-            "Space-separated list of CC tools to enable "
-            '(e.g. "Bash Edit Read Grep Glob Write"). '
-            "Omit for all tools."
+            "Override: space-separated CC tools to auto-approve "
+            '(e.g. "Bash(git *) Edit Read").'
+        ),
+    },
+    "disallowedTools": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": (
+            "Override: list of tool patterns to deny entirely "
+            '(e.g. ["Bash(rm -rf *)", "Bash(sudo *)"]). '
+            "Replaces the tier's deny list."
         ),
     },
     "workingDirectory": {
@@ -720,6 +900,18 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "tiers",
+        "description": (
+            "List all available permission tiers with descriptions. "
+            "Call this to understand what each tier allows before "
+            "choosing one for a task."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
         "name": "ping",
         "description": "Test MCP server connection.",
         "inputSchema": {
@@ -782,13 +974,18 @@ def extract_common_args(args: dict[str, Any]) -> dict[str, Any]:
         add_dirs = None
     budget_raw = args.get("maxBudgetUsd")
     budget = float(budget_raw) if budget_raw else None
+    disallowed = args.get("disallowedTools")
+    if disallowed and not isinstance(disallowed, list):
+        disallowed = None
 
     return {
+        "tier": args.get("tier"),
         "model": args.get("model"),
         "effort": args.get("effort"),
         "system_prompt": args.get("systemPrompt"),
         "permission_mode": args.get("permissionMode"),
         "allowed_tools": args.get("allowedTools"),
+        "disallowed_tools": disallowed,
         "working_directory": args.get("workingDirectory"),
         "add_dirs": add_dirs,
         "max_budget_usd": budget,
@@ -939,6 +1136,27 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             return tool_success(
                 request_id,
                 {"jobs": jobs, "count": len(jobs)},
+            )
+
+        # ── tiers ────────────────────────────────────────────────────
+        if name == "tiers":
+            tier_info = {
+                tier_name: {
+                    "description": cfg["description"],
+                    "permissionMode": cfg["permission_mode"],
+                    "tools": cfg.get("tools") or "all (default)",
+                    "denyPatterns": cfg.get("disallowed_tools", []),
+                    "isDefault": tier_name == DEFAULT_TIER,
+                }
+                for tier_name, cfg in PERMISSION_TIERS.items()
+            }
+            return tool_success(
+                request_id,
+                {
+                    "tiers": tier_info,
+                    "defaultTier": DEFAULT_TIER,
+                    "hierarchy": "readonly < explore < edit < full < unrestricted",
+                },
             )
 
         # ── ping ─────────────────────────────────────────────────────
