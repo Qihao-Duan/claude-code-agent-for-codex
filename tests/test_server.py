@@ -225,14 +225,14 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         self.assertNotIn("--bare", cmd)
 
     def test_build_command_adds_bare_for_isolated_profile(self) -> None:
-        cmd = self.server.build_command(
+        isolated_cmd = self.server.build_command(
             "prompt",
             tier="readonly",
             runtime_profile="isolated",
         )
-        self.assertIn("stream-json", cmd)
-        self.assertIn("--verbose", cmd)
-        self.assertIn("--bare", cmd)
+        self.assertIn("stream-json", isolated_cmd)
+        self.assertIn("--verbose", isolated_cmd)
+        self.assertIn("--bare", isolated_cmd)
 
         integrated_cmd = self.server.build_command(
             "prompt",
@@ -241,6 +241,8 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         )
         self.assertNotIn("--bare", integrated_cmd)
         self.assertNotIn("--disable-slash-commands", integrated_cmd)
+        self.assertNotIn("--strict-mcp-config", integrated_cmd)
+        self.assertNotIn("--mcp-config", integrated_cmd)
 
         simple_cmd = self.server.build_command(
             "prompt",
@@ -249,6 +251,10 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         )
         self.assertNotIn("--bare", simple_cmd)
         self.assertIn("--disable-slash-commands", simple_cmd)
+
+        self.assertNotIn("--disable-slash-commands", isolated_cmd)
+        self.assertNotIn("--strict-mcp-config", isolated_cmd)
+        self.assertNotIn("--mcp-config", isolated_cmd)
 
     def test_build_command_preserves_zero_budget(self) -> None:
         cmd = self.server.build_command(
@@ -262,6 +268,23 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
     def test_extract_common_args_preserves_zero_budget(self) -> None:
         common = self.server.extract_common_args({"maxBudgetUsd": 0})
         self.assertEqual(common["max_budget_usd"], 0.0)
+
+    def test_error_suggestion_ignores_invalid_runtime_profile(self) -> None:
+        suggestion = self.server.error_suggestion(
+            "auth_required",
+            runtime_profile="definitely-invalid",
+        )
+        self.assertEqual(
+            suggestion,
+            "Authenticate Claude Code locally before retrying.",
+        )
+
+    def test_error_suggestion_preserves_isolated_auth_guidance(self) -> None:
+        suggestion = self.server.error_suggestion(
+            "auth_required",
+            runtime_profile="isolated",
+        )
+        self.assertIn("ANTHROPIC_API_KEY", suggestion)
 
     def test_extract_sync_timeout_validates_positive_integer(self) -> None:
         self.assertEqual(

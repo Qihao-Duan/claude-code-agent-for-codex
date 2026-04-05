@@ -270,13 +270,19 @@ def error_suggestion(
         )
     if kind == "api_connection_refused":
         return "Retry later or run `claude -p` directly to verify Claude CLI/API health."
-    if kind == "auth_required" and validate_runtime_profile(runtime_profile) == "isolated":
-        return (
-            "Isolated mode uses --bare and does not read local OAuth/keychain state. "
-            "Provide ANTHROPIC_API_KEY or apiKeyHelper, or switch back to simple "
-            "or integrated."
-        )
     if kind == "auth_required":
+        # Suggestion helpers should never raise while formatting an existing
+        # error payload for the caller.
+        try:
+            resolved_runtime_profile = validate_runtime_profile(runtime_profile)
+        except ValueError:
+            resolved_runtime_profile = None
+        if resolved_runtime_profile == "isolated":
+            return (
+                "Isolated mode uses --bare and does not read local OAuth/keychain state. "
+                "Provide ANTHROPIC_API_KEY or apiKeyHelper, or switch back to simple "
+                "or integrated."
+            )
         return "Authenticate Claude Code locally before retrying."
     return None
 

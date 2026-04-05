@@ -19,7 +19,7 @@ single MCP capability.
   emitted init, tool-use, assistant text, and terminal result events exactly as
   expected.
 - Runtime-profile comparison on 2026-04-06: a "simple" launch
-  (`--disable-slash-commands --strict-mcp-config --mcp-config {"mcpServers":{}}`)
+  (`--disable-slash-commands --strict-mcp-config --mcp-config {"mcpServers": {}}`)
   produced `slash_commands=[]` and `mcp_servers=[]` while preserving non-`bare`
   auth behavior.
 - Live MCP smoke on 2026-04-06: integrated review still surfaced a structured
