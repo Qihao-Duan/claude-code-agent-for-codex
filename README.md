@@ -1,110 +1,297 @@
 # claude-code-agent-for-codex
 
-MCP server that exposes Claude Code's **full autonomous agent loop** to Codex.
+Expose Claude Code's full autonomous agent loop to Codex over MCP.
 
-This is the symmetric counterpart of
-[codex-mcp-server](https://github.com/tuannvm/codex-mcp-server) (which lets
-Claude Code call Codex). The key distinction from `claude mcp serve` (CC's
-built-in MCP server) is that this wraps the **agent loop** (`claude -p`), not
-the individual low-level tools (Read/Edit/Bash).
+This server is the reverse bridge of `codex-mcp-server`: instead of letting
+Claude Code call Codex, it lets Codex delegate work to `claude -p` as a real
+agent. The goal is not to mirror Claude Code's low-level tools one by one, but
+to hand off multi-step reasoning, exploration, editing, and verification as a
+single MCP capability.
 
-## Architecture
+## Status
 
-```
-Codex (client) ──MCP──> this server ──subprocess──> claude -p (agent loop)
-                                                        │
-                                                   Read, Edit, Bash,
-                                                   Grep, Glob, Write, ...
-```
+- Current version: `v2.1.1`
+- Local validation: 14 deterministic unit tests covering sync and async paths,
+  structured failures, session resume, `claude_reply_start`,
+  `claude_list_jobs`, parse fallback, zero-budget handling, and invalid
+  configuration guards.
+- Live smoke on 2026-04-05: a sync review request returned a structured
+  `sync_timeout`, and a later async review surfaced a structured
+  `api_connection_refused` error with heartbeat and log metadata intact.
 
-## Tools
+## Use Cases
 
-| Tool | Mode | Description |
-|------|------|-------------|
-| `claude` | sync | Execute CC agent, return structured result with threadId |
-| `claude_reply` | sync | Continue a previous CC session via threadId |
-| `claude_start` | async | Start background CC task, return jobId immediately |
-| `claude_reply_start` | async | Background follow-up in existing session |
-| `claude_status` | poll | Check/wait for async job completion |
-| `claude_list_jobs` | — | List all background jobs |
-| `ping` | — | Health check |
-| `help` | — | Return `claude --help` output |
+- Delegate deep codebase analysis from Codex to Claude Code.
+- Run longer background jobs without getting trapped by MCP client timeouts.
+- Keep a session alive across follow-up turns with `threadId`.
+- Choose between safer constrained modes and higher-capability modes with
+  explicit runtime and permission controls.
 
-### Sync vs Async
+## Quick Start
 
-- **Sync** (`claude`, `claude_reply`): for tasks that finish within MCP
-  timeout (~120s). Simpler, returns result directly.
-- **Async** (`claude_start` + `claude_status`): for long-running tasks (deep
-  codebase refactors, multi-file edits, test runs). Returns jobId immediately;
-  poll `claude_status` with optional `waitSeconds` for bounded blocking.
+### Prerequisites
 
-## Install
+1. Install Claude Code and confirm `claude -p` works on the machine.
+2. Make sure Codex can run local stdio MCP servers.
+
+### Install in Codex
 
 ```bash
-# Register with Codex
-codex mcp add claude-code-agent -- python3 ~/.codex/mcp-servers/claude-code-agent-for-codex/server.py
+codex mcp add claude-code-agent -- \
+  python3 ~/.codex/mcp-servers/claude-code-agent-for-codex/server.py
 ```
 
-With custom model:
+Optional defaults:
+
 ```bash
 codex mcp add claude-code-agent \
   --env CC_AGENT_MODEL=opus \
+  --env CC_AGENT_DEFAULT_TIER=edit \
+  --env CC_AGENT_RUNTIME_PROFILE=integrated \
   -- python3 ~/.codex/mcp-servers/claude-code-agent-for-codex/server.py
 ```
 
+Verify registration:
+
+```bash
+codex mcp list
+```
+
+## How It Works
+
+```text
+Codex (client) -> MCP -> this server -> claude -p -> Claude Code agent loop
+```
+
+The server supports two execution styles:
+
+- Sync: `claude`, `claude_reply`
+  Best for short tasks. These calls use a shorter sync timeout by default so
+  they return a structured `sync_timeout` error before the MCP client itself
+  times out.
+- Async: `claude_start`, `claude_reply_start`, `claude_status`
+  Best for long-running work. Async jobs persist state on disk, emit heartbeat
+  timestamps, and expose per-job logs.
+
+## Tools
+
+| Tool | Purpose |
+|------|---------|
+| `claude` | Run Claude Code synchronously and return `{threadId, response, ...}` |
+| `claude_reply` | Continue a prior Claude Code session |
+| `claude_start` | Start a background job and return a `jobId` immediately |
+| `claude_reply_start` | Background follow-up for an existing session |
+| `claude_status` | Poll a background job, optionally waiting for bounded time |
+| `claude_list_jobs` | List recent background jobs |
+| `tiers` | Inspect available permission tiers |
+| `ping` | Health check |
+| `help` | Return `claude --help` output |
+
+## Permission Tiers
+
+The server exposes a higher-level tier model on top of Claude Code's own
+permission system.
+
+| Tier | Permission Mode | Typical Use |
+|------|------------------|-------------|
+| `readonly` | `plan` | Review, analysis, architecture questions |
+| `explore` | `auto` | Investigation, logs, repo inspection |
+| `edit` | `auto` | Default coding mode with extra deny rules |
+| `full` | `auto` | Maximum Claude flexibility, no extra server deny list |
+| `unrestricted` | `bypassPermissions` | Sandbox environments only |
+
+`edit` remains the default because it keeps Claude Code productive while still
+blocking obviously destructive shell patterns such as force-push, hard reset,
+and recursive delete.
+
+## Runtime Profiles
+
+The server supports two runtime profiles:
+
+- `integrated` (default)
+  Inherits the local Claude Code environment, including local auth state,
+  plugins, skills, and MCP configuration. This is the most compatible mode.
+- `isolated`
+  Runs Claude Code with `--bare` for a cleaner and more predictable execution
+  environment.
+
+Important auth note:
+
+- `isolated` does not rely on local OAuth or keychain state.
+- In practice, it usually requires explicit auth such as `ANTHROPIC_API_KEY`
+  or an `apiKeyHelper` setting.
+- If you see `Not logged in · Please run /login` in isolated mode, that is
+  expected unless explicit auth is configured for `--bare`.
+
+## Parameters
+
+Common parameters accepted by the execution tools:
+
+| Parameter | Type | Notes |
+|-----------|------|-------|
+| `prompt` | string | Required task or follow-up prompt |
+| `tier` | enum | `readonly`, `explore`, `edit`, `full`, `unrestricted` |
+| `model` | string | Claude model override |
+| `effort` | enum | `low`, `medium`, `high`, `max` |
+| `systemPrompt` | string | Custom system prompt |
+| `permissionMode` | enum | Override the tier's permission mode |
+| `allowedTools` | string | Explicit Claude tool allow override |
+| `disallowedTools` | string[] | Explicit Claude deny override |
+| `workingDirectory` | string | Working directory for the agent |
+| `addDirs` | string[] | Extra directories granted to Claude |
+| `maxBudgetUsd` | number | Claude Code budget cap |
+| `runtimeProfile` | enum | `integrated` or `isolated` |
+
+Sync-only:
+
+| Parameter | Type | Notes |
+|-----------|------|-------|
+| `syncTimeoutSec` | integer | Override the sync timeout for `claude` and `claude_reply` |
+
+## Async Job Fields
+
+`claude_status` and `claude_list_jobs` return extra job-state fields beyond the
+final Claude response:
+
+- `phase`: `queued`, `launching`, `starting_claude`, `running`,
+  `parsing_output`, `completed`, `failed`
+- `lastHeartbeatAt`: last heartbeat timestamp while Claude is still running
+- `childPid`: active Claude subprocess PID when known
+- `logPath`: lifecycle log for the job
+- `startedCommand`: shell-escaped Claude command
+
+This makes it easier to distinguish "still running", "timed out", "failed to
+launch", and "Claude itself returned an error".
+
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CLAUDE_BIN` | `claude` | Path to Claude Code CLI |
-| `CC_AGENT_MODEL` | *(CC default)* | Default model (`opus`, `sonnet`, `haiku`, or full ID) |
-| `CC_AGENT_EFFORT` | *(CC default)* | Default effort level (`low`/`medium`/`high`/`max`) |
-| `CC_AGENT_SYSTEM_PROMPT` | *(none)* | Default system prompt |
-| `CC_AGENT_PERMISSION_MODE` | `auto` | Default permission mode |
-| `CC_AGENT_TIMEOUT_SEC` | `900` | Subprocess timeout (seconds) |
-| `CC_AGENT_MAX_BUDGET_USD` | *(none)* | Default budget cap per invocation |
-| `CC_AGENT_DEBUG_LOG` | `/tmp/claude-code-agent-for-codex-debug.log` | Debug log path |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CLAUDE_BIN` | `claude` | Claude Code CLI path |
+| `CC_AGENT_MODEL` | Claude default | Default model override |
+| `CC_AGENT_EFFORT` | Claude default | Default effort override |
+| `CC_AGENT_SYSTEM_PROMPT` | unset | Default system prompt |
+| `CC_AGENT_DEFAULT_TIER` | `edit` | Default tier when none is provided |
+| `CC_AGENT_TIMEOUT_SEC` | `900` | Hard timeout for the underlying Claude subprocess |
+| `CC_AGENT_SYNC_TIMEOUT_SEC` | `90` | Timeout used by sync MCP calls |
+| `CC_AGENT_RUNTIME_PROFILE` | `integrated` | Default runtime profile |
+| `CC_AGENT_HEARTBEAT_SEC` | `5` | Async heartbeat interval |
+| `CC_AGENT_MAX_BUDGET_USD` | unset | Default budget cap |
+| `CC_AGENT_DEBUG_LOG` | `/tmp/claude-code-agent-for-codex-debug.log` | Server debug log |
 | `CC_AGENT_STATE_DIR` | `~/.codex/state/claude-code-agent-for-codex/` | Async job state directory |
 
-## Common Parameters (all tools)
+## Examples
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `prompt` | string | Task/instruction (required) |
-| `model` | string | Model override |
-| `effort` | enum | `low`/`medium`/`high`/`max` |
-| `systemPrompt` | string | Custom system prompt |
-| `permissionMode` | enum | `default`/`plan`/`auto`/`bypassPermissions` |
-| `allowedTools` | string | Space-separated tool names |
-| `workingDirectory` | string | Working directory |
-| `addDirs` | string[] | Additional directories for tool access |
-| `maxBudgetUsd` | number | Budget cap |
+Short readonly analysis:
 
-## Design Rationale
+```json
+{
+  "name": "claude",
+  "arguments": {
+    "prompt": "Review src/parser.ts for edge cases.",
+    "tier": "readonly",
+    "syncTimeoutSec": 60
+  }
+}
+```
 
-### Why not `claude mcp serve`?
+Background refactor:
 
-`claude mcp serve` exposes CC's individual tools (Read, Edit, Bash...) as MCP
-tools. Codex already has equivalent capabilities. What Codex needs from CC is
-the **agent judgment** — the ability to autonomously plan, explore, edit, and
-verify across multiple steps.
+```json
+{
+  "name": "claude_start",
+  "arguments": {
+    "prompt": "Refactor the CSV importer and run tests.",
+    "tier": "edit",
+    "workingDirectory": "/path/to/repo"
+  }
+}
+```
 
-### Why async jobs?
+Background polling:
 
-CC agent tasks can take 2-15 minutes for complex refactors. MCP tool calls
-typically timeout around 120 seconds. The async pattern (start + poll)
-decouples execution from the MCP timeout.
+```json
+{
+  "name": "claude_status",
+  "arguments": {
+    "jobId": "abc123",
+    "waitSeconds": 30
+  }
+}
+```
 
-### Why `--permission-mode auto` by default?
+Clean diagnostic run:
 
-When CC runs as a delegated agent, human-in-the-loop approval creates a
-deadlock (no human is watching). `auto` mode lets CC auto-approve safe
-operations while still blocking destructive ones. Use `bypassPermissions`
-only in trusted sandboxed environments.
+```json
+{
+  "name": "claude_start",
+  "arguments": {
+    "prompt": "Reply with exactly: smoke-ok",
+    "tier": "readonly",
+    "runtimeProfile": "isolated"
+  }
+}
+```
 
-## References
+## Troubleshooting
 
-- [MCP Specification (2025-03-26)](https://modelcontextprotocol.io/specification/2025-03-26)
-- [Claude Code CLI Documentation](https://docs.anthropic.com/en/docs/claude-code)
-- [Multi-agent task delegation patterns](https://arxiv.org/abs/2402.01680)
-- [codex-mcp-server (symmetric counterpart)](https://github.com/tuannvm/codex-mcp-server)
+### Sync call returns `sync_timeout`
+
+Use `claude_start` plus `claude_status`. Sync calls intentionally fail earlier
+than the MCP client's outer timeout so callers get a structured error.
+
+### Async job stays in `running`
+
+Inspect:
+
+- `lastHeartbeatAt`
+- `logPath`
+- the sibling `*.stdout.log` and `*.stderr.log` files in the job state directory
+
+If `lastHeartbeatAt` is still moving, the server is healthy and Claude is still
+working.
+
+### `API Error: Unable to connect to API (ECONNREFUSED)`
+
+This is coming from Claude Code itself, not from the MCP transport layer. Run
+`claude -p` directly to confirm local Claude CLI and API health, then retry.
+
+### Isolated mode says `Not logged in`
+
+That usually means `--bare` does not have explicit auth configured. Provide
+`ANTHROPIC_API_KEY` or an `apiKeyHelper`, or switch back to `integrated`.
+
+## Development
+
+Run the stub-based test suite:
+
+```bash
+python3 -m unittest -v tests.test_server
+```
+
+Quick syntax check:
+
+```bash
+python3 -m py_compile server.py tests/test_server.py
+```
+
+The current test suite covers:
+
+- sync timeout handling before MCP transport timeout
+- invalid tier and invalid sync-timeout validation
+- `claude_reply` and `claude_reply_start` session continuation
+- async phase transitions, heartbeat updates, and persisted error payloads
+- `claude_list_jobs` output
+- raw stdout fallback for non-JSON success output
+- structured handling for stderr-only nonzero exits
+- isolated-mode auth guidance
+- `maxBudgetUsd=0` parsing and command generation
+- rejection of partial stdout/stderr log path configuration
+
+For deeper design notes and rationale, see [INTRODUCTION.md](./INTRODUCTION.md).
+
+## Related Projects
+
+- `codex-mcp-server`: Claude Code -> Codex
+- `claude mcp serve`: low-level Claude Code tool exposure
+- this project: Codex -> Claude Code agent delegation
