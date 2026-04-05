@@ -10,11 +10,11 @@ single MCP capability.
 
 ## Status
 
-- Current version: `v2.1.1`
-- Local validation: 14 deterministic unit tests covering sync and async paths,
+- Current version: `v2.1.2`
+- Local validation: 16 deterministic unit tests covering sync and async paths,
   structured failures, session resume, `claude_reply_start`,
-  `claude_list_jobs`, parse fallback, zero-budget handling, and invalid
-  configuration guards.
+  `claude_list_jobs`, progress notifications, parse fallback, zero-budget
+  handling, and invalid configuration guards.
 - Live smoke on 2026-04-05: a sync review request returned a structured
   `sync_timeout`, and a later async review surfaced a structured
   `api_connection_refused` error with heartbeat and log metadata intact.
@@ -68,20 +68,29 @@ The server supports two execution styles:
 - Sync: `claude`, `claude_reply`
   Best for short tasks. These calls use a shorter sync timeout by default so
   they return a structured `sync_timeout` error before the MCP client itself
-  times out.
+  times out. When the client provides `_meta.progressToken` (Codex does), the
+  server emits `notifications/progress` during the run.
 - Async: `claude_start`, `claude_reply_start`, `claude_status`
   Best for long-running work. Async jobs persist state on disk, emit heartbeat
-  timestamps, and expose per-job logs.
+  timestamps, expose per-job logs, and `claude_status` can emit
+  `notifications/progress` during bounded waits.
+
+Important boundary:
+
+- Progress notifications improve visibility.
+- They do not turn a single synchronous MCP tool call into an unbounded task.
+- If the work might outlive the client's tool timeout budget, the correct path
+  is still `claude_start` or `claude_reply_start`, followed by `claude_status`.
 
 ## Tools
 
 | Tool | Purpose |
 |------|---------|
-| `claude` | Run Claude Code synchronously and return `{threadId, response, ...}` |
-| `claude_reply` | Continue a prior Claude Code session |
+| `claude` | Run Claude Code synchronously for short tasks |
+| `claude_reply` | Continue a prior Claude Code session synchronously |
 | `claude_start` | Start a background job and return a `jobId` immediately |
 | `claude_reply_start` | Background follow-up for an existing session |
-| `claude_status` | Poll a background job, optionally waiting for bounded time |
+| `claude_status` | Poll a background job, optionally waiting with progress notifications |
 | `claude_list_jobs` | List recent background jobs |
 | `tiers` | Inspect available permission tiers |
 | `ping` | Health check |
@@ -158,6 +167,8 @@ final Claude response:
 - `lastHeartbeatAt`: last heartbeat timestamp while Claude is still running
 - `childPid`: active Claude subprocess PID when known
 - `logPath`: lifecycle log for the job
+- `stdoutPath` / `stderrPath`: persisted Claude stdout/stderr log files
+- `latestLogLine`: newest lifecycle log entry
 - `startedCommand`: shell-escaped Claude command
 
 This makes it easier to distinguish "still running", "timed out", "failed to
@@ -176,6 +187,7 @@ launch", and "Claude itself returned an error".
 | `CC_AGENT_SYNC_TIMEOUT_SEC` | `90` | Timeout used by sync MCP calls |
 | `CC_AGENT_RUNTIME_PROFILE` | `integrated` | Default runtime profile |
 | `CC_AGENT_HEARTBEAT_SEC` | `5` | Async heartbeat interval |
+| `CC_AGENT_STATUS_PROGRESS_SEC` | `2` | Minimum interval between progress notifications while waiting in `claude_status` |
 | `CC_AGENT_MAX_BUDGET_USD` | unset | Default budget cap |
 | `CC_AGENT_DEBUG_LOG` | `/tmp/claude-code-agent-for-codex-debug.log` | Server debug log |
 | `CC_AGENT_STATE_DIR` | `~/.codex/state/claude-code-agent-for-codex/` | Async job state directory |
@@ -240,12 +252,20 @@ Clean diagnostic run:
 Use `claude_start` plus `claude_status`. Sync calls intentionally fail earlier
 than the MCP client's outer timeout so callers get a structured error.
 
+### Long-running task still times out
+
+If the client keeps using `claude` or `claude_reply`, progress notifications
+will improve visibility but will not remove the synchronous timeout boundary.
+For genuinely long work, use `claude_start` or `claude_reply_start`, then poll
+with `claude_status`.
+
 ### Async job stays in `running`
 
 Inspect:
 
 - `lastHeartbeatAt`
 - `logPath`
+- `latestLogLine`
 - the sibling `*.stdout.log` and `*.stderr.log` files in the job state directory
 
 If `lastHeartbeatAt` is still moving, the server is healthy and Claude is still
@@ -281,7 +301,9 @@ The current test suite covers:
 - invalid tier and invalid sync-timeout validation
 - `claude_reply` and `claude_reply_start` session continuation
 - async phase transitions, heartbeat updates, and persisted error payloads
+- progress notification emission for sync calls and async status waits
 - `claude_list_jobs` output
+- `latestLogLine` / stdout-stderr path exposure in async status
 - raw stdout fallback for non-JSON success output
 - structured handling for stderr-only nonzero exits
 - isolated-mode auth guidance

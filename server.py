@@ -33,11 +33,11 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # ── Configuration via environment ────────────────────────────────────────
 SERVER_NAME = "claude-code-agent-for-codex"
-SERVER_VERSION = "2.1.1"
+SERVER_VERSION = "2.1.2"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 DEFAULT_MODEL = os.environ.get("CC_AGENT_MODEL", "")
@@ -49,6 +49,9 @@ DEFAULT_SYNC_TIMEOUT_SEC = int(os.environ.get("CC_AGENT_SYNC_TIMEOUT_SEC", "90")
 DEFAULT_MAX_BUDGET = os.environ.get("CC_AGENT_MAX_BUDGET_USD", "")
 DEFAULT_RUNTIME_PROFILE = os.environ.get("CC_AGENT_RUNTIME_PROFILE", "integrated")
 HEARTBEAT_INTERVAL_SEC = float(os.environ.get("CC_AGENT_HEARTBEAT_SEC", "5"))
+STATUS_PROGRESS_INTERVAL_SEC = float(
+    os.environ.get("CC_AGENT_STATUS_PROGRESS_SEC", "2")
+)
 
 # ── Permission Tiers ────────────────────────────────────────────────────
 #
@@ -280,6 +283,51 @@ def send_response(response: dict[str, Any]) -> None:
         header = f"Content-Length: {len(payload)}\r\n\r\n".encode("utf-8")
         MCP_STDOUT.write(header + payload)
     MCP_STDOUT.flush()
+
+
+def send_notification(method: str, params: dict[str, Any]) -> None:
+    send_response(
+        {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }
+    )
+
+
+def extract_progress_token(params: dict[str, Any]) -> str | int | None:
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return None
+    token = meta.get("progressToken")
+    if isinstance(token, bool):
+        return None
+    if isinstance(token, (str, int)):
+        return token
+    return None
+
+
+def make_progress_notifier(
+    progress_token: str | int | None,
+) -> Callable[[str], None] | None:
+    if progress_token is None:
+        return None
+
+    progress_value = 0
+
+    def notify(message: str) -> None:
+        nonlocal progress_value
+        send_notification(
+            "notifications/progress",
+            {
+                "progressToken": progress_token,
+                "progress": progress_value,
+                "message": clip_text(message, limit=400),
+            },
+        )
+        progress_value += 1
+
+    return notify
 
 
 def read_message() -> dict[str, Any] | None:
@@ -652,6 +700,7 @@ def run_claude_agent(
     keep_logs: bool = False,
     on_start: Any = None,
     on_heartbeat: Any = None,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Run ``claude -p`` synchronously and return structured result."""
     try:
@@ -681,6 +730,26 @@ def run_claude_agent(
         env["PWD"] = working_directory
 
     timeout_value = timeout_sec if timeout_sec is not None else DEFAULT_TIMEOUT_SEC
+    started_monotonic = time.monotonic()
+
+    def handle_start(child_pid: int, child_command: str) -> None:
+        if on_start:
+            on_start(child_pid, child_command)
+        if progress_callback:
+            progress_callback(f"Claude started (pid={child_pid})")
+
+    def handle_heartbeat(child_pid: int) -> None:
+        if on_heartbeat:
+            on_heartbeat(child_pid)
+        if progress_callback:
+            elapsed = max(int(time.monotonic() - started_monotonic), 0)
+            progress_callback(
+                f"Claude still running after {elapsed}s (pid={child_pid})"
+            )
+
+    if progress_callback:
+        progress_callback("Launching Claude CLI")
+
     try:
         result = execute_claude_command(
             cmd,
@@ -691,8 +760,8 @@ def run_claude_agent(
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             keep_logs=keep_logs,
-            on_start=on_start,
-            on_heartbeat=on_heartbeat,
+            on_start=handle_start,
+            on_heartbeat=handle_heartbeat,
         )
     except ValueError as exc:
         return None, build_error(
@@ -708,6 +777,10 @@ def run_claude_agent(
         )
 
     if result["timed_out"]:
+        if progress_callback:
+            progress_callback(
+                f"Claude timed out after {timeout_value}s; switching to error response"
+            )
         return None, build_error(
             "sync_timeout",
             f"Claude agent timed out after {timeout_value}s",
@@ -718,6 +791,8 @@ def run_claude_agent(
 
     payload, parse_error = parse_claude_json(result["stdout"])
     if parse_error:
+        if progress_callback:
+            progress_callback("Claude process exited; parsing output")
         stderr = result["stderr"].strip()
         raw_stdout = result["stdout"].strip()
         raw_text = raw_stdout or stderr
@@ -767,6 +842,8 @@ def run_claude_agent(
     assert payload is not None
 
     if result["returncode"] != 0 or payload.get("is_error"):
+        if progress_callback:
+            progress_callback("Claude returned an error payload")
         message = str(
             payload.get("result")
             or payload.get("error")
@@ -788,6 +865,9 @@ def run_claude_agent(
     response_text = str(payload.get("result", "")).strip()
     model_name = payload.get("model", "") or model or DEFAULT_MODEL
     cost = payload.get("cost_usd") or payload.get("total_cost_usd")
+
+    if progress_callback:
+        progress_callback("Claude completed successfully")
 
     resolved_tier = tier or DEFAULT_TIER
     return {
@@ -834,6 +914,17 @@ def job_stderr_path(job_id: str) -> Path:
     return JOBS_DIR / f"{job_id}.stderr.log"
 
 
+def read_last_nonempty_line(path: Path) -> str | None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if line.strip():
+            return line.strip()
+    return None
+
+
 def append_job_log(job_id: str, message: str) -> None:
     log_path = job_log_path(job_id)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -863,6 +954,12 @@ def is_pid_alive(pid: int | None) -> bool:
 def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
     result = job.get("result") or {}
     request = job.get("request") or {}
+    log_path_value = job.get("logPath")
+    latest_log_line = (
+        read_last_nonempty_line(Path(log_path_value))
+        if isinstance(log_path_value, str) and log_path_value
+        else None
+    )
     return {
         "jobId": job.get("jobId"),
         "status": job.get("status"),
@@ -883,9 +980,22 @@ def serialize_job(job: dict[str, Any]) -> dict[str, Any]:
         "lastHeartbeatAt": job.get("lastHeartbeatAt"),
         "childPid": job.get("childPid"),
         "logPath": job.get("logPath"),
+        "stdoutPath": str(job_stdout_path(job.get("jobId"))),
+        "stderrPath": str(job_stderr_path(job.get("jobId"))),
+        "latestLogLine": latest_log_line,
         "startedCommand": job.get("startedCommand"),
         "resumeHint": "Call claude_status with this jobId until done=true.",
     }
+
+
+def format_job_progress_message(job: dict[str, Any]) -> str:
+    job_id = str(job.get("jobId") or "unknown")
+    phase = job.get("phase") or job.get("status") or "unknown"
+    parts = [f"Job {job_id} is {phase}"]
+    latest_log_line = read_last_nonempty_line(job_log_path(job_id))
+    if latest_log_line:
+        parts.append(latest_log_line)
+    return " · ".join(parts)
 
 
 def start_async_agent(
@@ -981,13 +1091,18 @@ def start_async_agent(
 
 
 def get_job_status(
-    job_id: str, *, wait_seconds: int = 0
+    job_id: str,
+    *,
+    wait_seconds: int = 0,
+    progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     job_path = job_state_path(job_id)
     if not job_path.exists():
         return None, build_error("unknown_job", f"Unknown jobId: {job_id}")
 
     deadline = time.monotonic() + max(wait_seconds, 0)
+    last_progress_signature: tuple[Any, ...] | None = None
+    last_progress_at = 0.0
     while True:
         job = read_json(job_path)
         if job.get("status") in {
@@ -1004,6 +1119,22 @@ def get_job_status(
             job["updatedAt"] = job["completedAt"]
             write_json(job_path, job)
             append_job_log(job_id, "JOB_FAILED error=Background worker exited before completing")
+        if progress_callback:
+            progress_signature = (
+                job.get("status"),
+                job.get("phase"),
+                job.get("lastHeartbeatAt"),
+                job.get("completedAt"),
+                read_last_nonempty_line(job_log_path(job_id)),
+            )
+            now = time.monotonic()
+            if (
+                progress_signature != last_progress_signature
+                or now - last_progress_at >= STATUS_PROGRESS_INTERVAL_SEC
+            ):
+                progress_callback(format_job_progress_message(job))
+                last_progress_signature = progress_signature
+                last_progress_at = now
         if job.get("status") in TERMINAL_JOB_STATES:
             return serialize_job(job), None
         if time.monotonic() >= deadline:
@@ -1232,10 +1363,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "claude",
         "description": (
-            "Execute Claude Code agent in non-interactive mode for autonomous "
-            "coding tasks. The agent can read/edit files, run commands, search "
-            "codebases, and perform multi-step reasoning. Returns structured "
-            "JSON with threadId (for follow-up) and response."
+            "Run Claude Code synchronously for short tasks. This path can emit "
+            "notifications/progress when the client provides _meta.progressToken, "
+            "but it is still bounded by syncTimeoutSec. For long-running work, "
+            "prefer claude_start plus claude_status."
         ),
         "inputSchema": {
             "type": "object",
@@ -1253,8 +1384,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "claude_reply",
         "description": (
-            "Continue a previous Claude Code session using the threadId "
-            "returned from a prior call. Maintains full conversation context."
+            "Continue a previous Claude Code session synchronously. Use only "
+            "for short follow-ups; long follow-ups should use "
+            "claude_reply_start plus claude_status."
         ),
         "inputSchema": {
             "type": "object",
@@ -1326,7 +1458,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "claude_status",
         "description": (
             "Check whether a background Claude agent job has finished. "
-            "Returns the full result when complete."
+            "Returns the full result when complete, and can emit "
+            "notifications/progress during bounded waits when the client "
+            "provides _meta.progressToken."
         ),
         "inputSchema": {
             "type": "object",
@@ -1528,6 +1662,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
     if method == "tools/call":
         name = params.get("name", "")
         args: dict[str, Any] = params.get("arguments", {}) or {}
+        progress_notifier = make_progress_notifier(extract_progress_token(params))
 
         # ── claude (sync) ────────────────────────────────────────────
         if name == "claude":
@@ -1542,6 +1677,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             payload, error = run_claude_agent(
                 prompt,
                 timeout_sec=sync_timeout or DEFAULT_SYNC_TIMEOUT_SEC,
+                progress_callback=progress_notifier,
                 **common,
             )
             if error:
@@ -1567,6 +1703,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                 prompt,
                 session_id=str(thread_id),
                 timeout_sec=sync_timeout or DEFAULT_SYNC_TIMEOUT_SEC,
+                progress_callback=progress_notifier,
                 **common,
             )
             if error:
@@ -1582,6 +1719,10 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             payload, error = start_async_agent(prompt, **common)
             if error:
                 return tool_error(request_id, error)
+            if progress_notifier:
+                progress_notifier(
+                    f"Queued background Claude job {payload.get('jobId')}."
+                )
             return tool_success(request_id, payload or {})
 
         # ── claude_reply_start (async) ───────────────────────────────
@@ -1600,6 +1741,10 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             )
             if error:
                 return tool_error(request_id, error)
+            if progress_notifier:
+                progress_notifier(
+                    f"Queued background Claude follow-up job {payload.get('jobId')}."
+                )
             return tool_success(request_id, payload or {})
 
         # ── claude_status ────────────────────────────────────────────
@@ -1615,7 +1760,9 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
                     request_id, "waitSeconds must be an integer"
                 )
             payload, error = get_job_status(
-                str(job_id), wait_seconds=max(wait_seconds, 0)
+                str(job_id),
+                wait_seconds=max(wait_seconds, 0),
+                progress_callback=progress_notifier,
             )
             if error:
                 return tool_error(request_id, error)

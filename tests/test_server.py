@@ -48,6 +48,7 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         self.server.DEFAULT_TIMEOUT_SEC = 5
         self.server.DEFAULT_RUNTIME_PROFILE = "integrated"
         self.server.HEARTBEAT_INTERVAL_SEC = 0.1
+        self.server.STATUS_PROGRESS_INTERVAL_SEC = 0.1
 
         self.env_patch = patch.dict(
             os.environ,
@@ -197,6 +198,45 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         self.assertEqual(payload["error"]["kind"], "sync_timeout")
         self.assertIn("claude_start", payload["error"]["suggestion"])
 
+    def test_sync_call_emits_progress_notifications(self) -> None:
+        os.environ["FAKE_CLAUDE_SLEEP"] = "0.35"
+        notifications: list[tuple[str, dict]] = []
+
+        with patch.object(
+            self.server,
+            "send_notification",
+            side_effect=lambda method, params: notifications.append((method, params)),
+        ):
+            response = self.server.handle_request(
+                {
+                    "id": 101,
+                    "method": "tools/call",
+                    "params": {
+                        "_meta": {"progressToken": 77},
+                        "name": "claude",
+                        "arguments": {
+                            "prompt": "hello",
+                            "tier": "readonly",
+                            "syncTimeoutSec": 1,
+                        },
+                    },
+                }
+            )
+
+        payload = self._tool_payload(response)
+        self.assertEqual(payload["response"], "hello")
+        self.assertGreaterEqual(len(notifications), 3)
+        self.assertTrue(
+            all(method == "notifications/progress" for method, _ in notifications)
+        )
+        self.assertTrue(
+            all(params["progressToken"] == 77 for _, params in notifications)
+        )
+        messages = [params["message"] for _, params in notifications]
+        self.assertIn("Launching Claude CLI", messages[0])
+        self.assertTrue(any("Claude still running" in message for message in messages))
+        self.assertIn("Claude completed successfully", messages[-1])
+
     def test_invalid_tier_does_not_kill_followup_requests(self) -> None:
         bad_response = self.server.handle_request(
             {
@@ -338,6 +378,46 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         self.assertEqual(final_status["phase"], "failed")
         self.assertEqual(final_status["error"]["kind"], "api_connection_refused")
 
+    def test_claude_status_emits_progress_and_exposes_latest_log_line(self) -> None:
+        os.environ["FAKE_CLAUDE_SLEEP"] = "1"
+        payload, error = self.server.start_async_agent("async-progress", tier="readonly")
+        self.assertIsNone(error)
+        job_id = payload["jobId"]
+        notifications: list[tuple[str, dict]] = []
+
+        with patch.object(
+            self.server,
+            "send_notification",
+            side_effect=lambda method, params: notifications.append((method, params)),
+        ):
+            status_response = self.server.handle_request(
+                {
+                    "id": 102,
+                    "method": "tools/call",
+                    "params": {
+                        "_meta": {"progressToken": "job-progress"},
+                        "name": "claude_status",
+                        "arguments": {
+                            "jobId": job_id,
+                            "waitSeconds": 1,
+                        },
+                    },
+                }
+            )
+
+        status_payload = self._tool_payload(status_response)
+        self.assertIn(status_payload["status"], {"running", "completed"})
+        self.assertIsNotNone(status_payload["latestLogLine"])
+        self.assertTrue(status_payload["stdoutPath"].endswith(".stdout.log"))
+        self.assertTrue(status_payload["stderrPath"].endswith(".stderr.log"))
+        self.assertGreaterEqual(len(notifications), 1)
+        self.assertTrue(
+            all(params["progressToken"] == "job-progress" for _, params in notifications)
+        )
+        self.assertTrue(
+            any("Job " in params["message"] for _, params in notifications)
+        )
+
     def test_claude_reply_start_and_list_jobs(self) -> None:
         response = self.server.handle_request(
             {
@@ -386,6 +466,7 @@ class ClaudeCodeAgentServerTests(unittest.TestCase):
         jobs_payload = self._tool_payload(list_response)
         self.assertGreaterEqual(jobs_payload["count"], 1)
         self.assertEqual(jobs_payload["jobs"][0]["jobId"], job_id)
+        self.assertIn("latestLogLine", jobs_payload["jobs"][0])
 
     def test_partial_log_paths_are_rejected(self) -> None:
         payload, error = self.server.run_claude_agent(

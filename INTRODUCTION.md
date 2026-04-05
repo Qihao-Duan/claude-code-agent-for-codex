@@ -53,6 +53,11 @@ The implementation intentionally uses a shorter sync timeout than the MCP
 client's outer timeout, so the caller gets a structured `sync_timeout` error
 instead of a generic transport failure.
 
+Recent versions also emit `notifications/progress` when the client supplies a
+progress token. That improves visibility, but it does not change the first
+principle: a synchronous tool call is still bounded. Progress is visibility,
+not infinite task duration.
+
 ### 2. Integrated vs Isolated Runtime
 
 The server now exposes two runtime profiles:
@@ -118,6 +123,9 @@ Each job now records:
 - `lastHeartbeatAt`
 - `childPid`
 - `logPath`
+- `stdoutPath`
+- `stderrPath`
+- `latestLogLine`
 - `startedCommand`
 
 This is important because "still running", "stuck", "timed out", "Claude
@@ -130,9 +138,9 @@ The lifecycle is intentionally explicit:
 queued -> launching -> starting_claude -> running -> parsing_output -> completed|failed
 ```
 
-## What Changed in v2.1.1
+## What Changed in v2.1.2
 
-The current implementation adds five practical improvements:
+The current implementation adds six practical improvements:
 
 1. Structured sync failures.
    Sync calls now fail with a typed error payload before the outer MCP client
@@ -148,6 +156,10 @@ The current implementation adds five practical improvements:
    Zero-budget requests, stderr-only failures, partial log-path configuration,
    and early-stdin-close cases now resolve to explicit and test-covered
    behavior.
+6. Progress visibility.
+   Sync calls and bounded async waits now emit `notifications/progress` when
+   the client provides a progress token, and async status responses now expose
+   the newest lifecycle log line directly.
 
 ## Validation Snapshot
 
@@ -162,6 +174,7 @@ The repo includes deterministic unit tests for:
 - `claude_reply_start` background continuation
 - `claude_list_jobs` enumeration
 - async heartbeat and phase transitions
+- progress notification emission for sync calls and async status waits
 - persisted async failure payloads
 - raw stdout fallback when Claude returns non-JSON success output
 - structured nonzero handling when Claude writes only to stderr
